@@ -4846,6 +4846,7 @@ class Service:
         # server's model); the next request after an unload starts the engine again
         self.idle_unload_s = 0
         self.min_free_vram_mib = 0
+        self.arena_holder = None                       # --keep-experts-in-ram: serve/arena_keep.py's holder (None: off)
         self.before_load = None
         self.before_load_timeout_s = 120.0               # #1997: how long the before_load command may run
         self.before_load_ignore_failure = False          # #1997: load even when it fails, without a VRAM check
@@ -5497,8 +5498,10 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
+            kept = getattr(self, "arena_holder", None) is not None and self.arena_holder.alive()
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+                  + ("the experts stay in system RAM, the next request starts the engine without reading them"
+                     if kept else "the next request loads it again"), flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
@@ -5755,6 +5758,8 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            # --keep-experts-in-ram: null when off, else whether the holder still owns the experts in RAM
+            "experts_in_ram": None if getattr(self, "arena_holder", None) is None else self.arena_holder.alive(),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -9936,6 +9941,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     ap.add_argument("--min-free-vram-mib", type=int, default=None,
                     help="load an unloaded model only when this much VRAM is free, else answer 503 (also "
                          "\"min_free_vram_mib\" in the config; default: always load)")
+    ap.add_argument("--keep-experts-in-ram", action="store_true",
+                    help="keep the experts in system RAM between unloads (opt-in): one process holds them while the "
+                         "GPU is free, so the next load skips the read of tens of GiB (also \"keep_experts_in_ram\": "
+                         "true in the config; docs/KEEP_RAM.md)")
     ap.add_argument("--before-load", help="a command run before the model is loaded again (e.g. to unload another "
                                           "server's model; also \"before_load\" in the config, a string or a list)")
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
@@ -10089,6 +10098,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    arena_holder = None
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -10172,6 +10182,31 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 split_mod.check_cfg(cfg, split)
         except split_mod.SplitConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        # --keep-experts-in-ram (opt-in, docs/KEEP_RAM.md): one holder process (serve/arena_keep.py) reads the experts
+        # into one memory object and keeps it while the server runs; every engine this server starts attaches to it
+        # through --shared-expert-arena and skips the read of tens of GiB. Unloading gives the GPU away; the RAM stays.
+        # The engines see the arena through cfg, so replicas and split serve attach to the holder's arena too (their
+        # own shared-arena plans then say the config already names one, which it does).
+        from serve import arena_keep as ak
+        if a.keep_experts_in_ram or ak.requested(cfg):
+            keep_arena, keep_note = ak.plan(cfg)
+            print(f"[strata] {keep_note}", flush=True)
+            if keep_arena:
+                arena_holder = ak.ArenaHolder(exe, engine_args(cfg, exe, announce=False), keep_arena,
+                                              cwd=cfg.get("cwd"), env=env, log=cfg.get("log"))
+                try:
+                    arena_holder.start()          # waits for ARENA READY: the read is the holder's, not the engine's
+                except Exception as e:            # noqa: BLE001 - the option never decides whether the server runs
+                    print(f"[strata] keep experts in RAM: not started ({str(e).splitlines()[0][:200]}); the model "
+                          "loads from the disk as before", flush=True)
+                    ak.remove_arena(keep_arena)
+                    arena_holder = None
+                else:
+                    cfg = {**cfg, "args": list(cfg.get("args") or []) + ["--shared-expert-arena", keep_arena]}
+                    threading.Thread(target=arena_holder.watch, daemon=True).start()
+                    import atexit
+                    atexit.register(arena_holder.stop)         # stdin's EOF ends it even if this server dies
+                    atexit.register(ak.remove_arena, keep_arena)
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         elif split:
@@ -10295,6 +10330,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.arena_holder = arena_holder                   # --keep-experts-in-ram: what an unload keeps in RAM (None: off)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
@@ -10457,6 +10493,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                 svc.wait_for_drain(5)
                 drained = False
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+                   arena_holder.stop if arena_holder is not None else None,
                    hub.close if hub is not None else None]
         try:
             for close in filter(None, closers):

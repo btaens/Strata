@@ -128,6 +128,7 @@ screens; leave out what you do not care about.
 | `PORT` | the port inside the container | `8080` |
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
+| `STRATA_KEEP_EXPERTS_IN_RAM` | `1`: when the model unloads, its experts stay in system RAM, so the next load skips reading them from the disk (39.97 GiB took 19-20 s at 6.40 GiB/s). The GPU is given back either way. Needs the experts' RAM plus about 12 GiB free. It pays only for an unload while the container keeps running - `POST /unload`, or `idle_unload_s` in the model's run settings (the Settings card); `docker stop` gives the RAM back in both cases, so on its own this option only holds memory. [KEEP_RAM.md](KEEP_RAM.md) | off |
 
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new

@@ -98,7 +98,44 @@ ARENA_PREFIX = "strata-replicas-"
 _MEMFDS: dict = {}                   # the memfds this server created: path (/proc/<pid>/fd/<n>) -> fd
 ARENA_MIN_RAM = 8 << 30              # a memfd arena: at least this much free RAM to try (the engine reserves the real size)
 ARENA_MIN_FREE = 8 << 30             # /dev/shm must have at least this much free to try (the engine reserves the real size)
-ARENA_INCOMPATIBLE = ("--mmap-experts", "--resident-experts", "--shared-expert-arena", "--resident-budget-gib")
+ARENA_INCOMPATIBLE = ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena")
+
+
+def all_args(cfg: dict) -> list[str]:
+    """Every engine argument this config can start an engine with, including a replica entry's own."""
+    out = [str(a) for a in cfg.get("args") or []]
+    for entry in (cfg.get("replicas") if isinstance(cfg.get("replicas"), list) else []):
+        if isinstance(entry, dict):
+            out += [str(a) for a in entry.get("args") or []]
+    return out
+
+
+def arena_incompatible_reason(cfg: dict, args: list[str] | None = None, for_what: str = "share") -> str | None:
+    """None when this config has a resident expert arena that can be shared or kept; the reason in one line when it
+    does not.  One rule for both users: the replicas sharing one arena (`shared_arena_plan`) and keeping the experts
+    in RAM over an unload (`serve/arena_keep.py`) need the same thing - the resident arena the engine builds by
+    default.  The mapped and budgeted RAM modes have no arena at all, the DeepSeek engine has no Qwen arena, and a
+    config that already names `--shared-expert-arena` has an owner that is not this server.
+    `for_what`: "share" (replicas/split) or "keep" (kept over an unload) - only the sentence differs."""
+    args = all_args(cfg) if args is None else args
+    keep = for_what == "keep"
+    mine = "keep" if keep else "share"
+    for flag in ARENA_INCOMPATIBLE:
+        if flag not in args:
+            continue
+        if flag == "--shared-expert-arena":
+            return ("this config already names a shared expert arena of its own; this server would be a second owner "
+                    "of it" if keep else
+                    "this config already names a shared expert arena; the replicas use the one this server makes")
+        return (f"this model/config has no resident expert arena to {mine}: it reads the experts from the file"
+                if keep else
+                "this model/config has no private expert arena to share; each replica keeps its own copy of the "
+                "experts in RAM")
+    if cfg.get("arch") == "deepseek41":
+        return (f"the DeepSeek engine has no Qwen expert arena to {mine}" if keep else
+                "this model/config has no private expert arena to share; each replica keeps its own copy of the "
+                "experts in RAM")
+    return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -178,13 +215,9 @@ def shared_arena_plan(cfg: dict, n_replicas: int, *, shm: str = "/dev/shm", plat
                                "the experts are in RAM once")
     if not platform.startswith("linux"):
         return None, "shared expert arena: Linux and Windows only; each replica keeps its own copy of the experts in RAM"
-    args = [str(a) for a in cfg.get("args") or []]
-    if isinstance(cfg.get("replicas"), list):
-        for e in cfg["replicas"]:
-            if isinstance(e, dict):
-                args += [str(a) for a in e.get("args") or []]
-    if cfg.get("arch") == "deepseek41" or any(a in args for a in ARENA_INCOMPATIBLE):
-        return None, "shared expert arena: this model/config has no private expert arena to share; each replica as before"
+    if arena_incompatible_reason(cfg):
+        return None, "shared expert arena: this model/config has no private expert arena to share; each replica keeps " \
+                     "its own copy of the experts in RAM"
     if use_memfd is None:
         use_memfd = hasattr(os, "memfd_create") and str(cfg.get("replica_shared_arena")).lower() != "devshm"
     if use_memfd:

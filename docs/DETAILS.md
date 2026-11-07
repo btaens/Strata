@@ -374,6 +374,14 @@ curl -X POST -H "Content-Type: application/json" localhost:8080/unload
 Monitor shows the state. Unloading ends the engine process and the image encoder, so their VRAM and RAM return at once. The
 model files stay in the OS file cache, so loading again takes seconds while that RAM is not needed elsewhere.
 
+**Keep the experts in RAM between unloads** (opt-in). `--keep-experts-in-ram` (or `"keep_experts_in_ram": true`,
+`STRATA_KEEP_EXPERTS_IN_RAM=1`) keeps one process holding the experts in system RAM across an unload, so the next
+engine starts without reading them off the disk again; the graphics card is still given back in full. A read that
+cost 19-20 s for 39.97 GiB on the bench run (6.40 GiB/s) is what the reload skips. `/v1/status` says
+`"experts_in_ram": true` while the holder is up, and the unload line says the experts stay. RAM for the experts
+plus about 12 GiB must be free at the server's start, or the option says one line and unloads as before.
+[KEEP_RAM.md](KEEP_RAM.md) has what it refuses and what a reload still pays.
+
 **Lazy start.** `serve/server.py --engine strata --config strata-<model>.json --lazy` (or `"lazy_load": true`) starts the HTTP
 API without the engine or the vision encoder. The first generation request or `POST /load` loads them, including
 `before_load` and `min_free_vram_mib`. `POST /v1/load` and `/v1/unload` are JSON control aliases (they need the API key,
@@ -477,8 +485,8 @@ trained with, not a hard token limit.
 
 All are optional. Setup rewrites the config when run again and keeps keys it does not manage. The About tab's Model settings
 card edits some of them (the sampling defaults, `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`,
-`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and
-`--vram-reserve-mib`). An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change
+`effort_position`, `aliases`, `idle_unload_s`, `keep_experts_in_ram`, `lazy_load`, `engine_silence_s`, `api_monitor`,
+`open_browser` and `--vram-reserve-mib`). An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change
 applies at the next start. Network, key, MCP and program keys are not editable there.
 
 | Key | Default | Effect |

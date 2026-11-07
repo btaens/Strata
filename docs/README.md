@@ -27,6 +27,7 @@ Use the guide for your GPU and operating system. Model and feature support can d
 | Apple Silicon | [Mac / Metal](MAC.md) |
 | More than one GPU | [Multiple GPUs](MULTI_GPU.md) |
 | Two cards: one reads the prompt, one makes the answer (opt-in) | [Split serving](SPLIT_SERVE.md) |
+| Keep the experts in RAM while the card is free (opt-in) | [Keep experts in RAM](KEEP_RAM.md) |
 | Older GPUs | [Experimental hardware](OLDER_GPUS.md) |
 
 ## Developers and contributors

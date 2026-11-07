@@ -207,6 +207,14 @@
       "supported": true
     },
     {
+      "id": "keep_experts_in_ram",
+      "label": "Keep the experts in memory when unloaded",
+      "group": "Serving",
+      "type": "boolean",
+      "hint": "On: when the model unloads, its expert weights stay in system memory, so loading it again skips reading them from the disk (tens of gigabytes, around 20-35 seconds saved). The graphics card is free for other programs; the memory stays used. Needs enough free memory for the experts plus about 12 GB; without it Strata says so at start and loads from the disk as usual.",
+      "supported": true
+    },
+    {
       "id": "parallel",
       "label": "Concurrent requests",
       "group": "Serving",

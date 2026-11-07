@@ -717,6 +717,10 @@ struct Options {
     bool coupled_draft = strata::core::coupled_draft_env(); ///< Coupled draft sampling for MTP drafter under sampling
     bool mmap_experts = false;    ///< R2.1: opt OUT of the resident arena, back to MapViewOfFile
     std::string shared_expert_arena; ///< Linux: optional file backing for the resident arena shared by processes
+    /// `--hold-expert-arena`: own the shared arena and nothing else.  Reads it (or attaches to one already read),
+    /// prints `ARENA READY`, and waits on stdin with no GPU context and no weights, so the experts stay in RAM while
+    /// the serving engine starts, frees the GPU, and starts again.
+    bool hold_expert_arena = false;
     bool resident_cpu_experts = false; ///< mmap-backed static-cache misses copied into ordinary RAM
     /// `--resident-experts` (the low-RAM PC's resident mode, chosen by setup): `--resident-cpu-experts` with the copy
     /// page-locked when the driver allows (else locked in the working set), 4 GiB of RAM headroom, and plain mmap
@@ -1286,6 +1290,10 @@ void usage() {
                  "  --shared-expert-arena FILE  Linux: back the resident arena with one MAP_SHARED file.\n"
                  "                       Put this file on /dev/shm, not ordinary SSD storage.\n"
                  "                       A small header binds an existing backing file to the same pack.\n"
+                 "  --hold-expert-arena  with --shared-expert-arena: read that arena into RAM, print ARENA READY,\n"
+                 "                       and wait for QUIT/EOF holding nothing but it - no GPU context, no weights -\n"
+                 "                       so the experts stay in RAM while the serving engine restarts.  Keep the\n"
+                 "                       file for the life of the server: an engine that finds it filled skips the read.\n"
                  "  --resident-cpu-experts  with mmap and a static profile, keep the experts the GPU cache does not\n"
                  "                       hold resident in ordinary RAM (and the prompt path's lend region as far as\n"
                  "                       RAM allows); adaptive swaps exchange them, so none is read from the file again.\n"
@@ -3715,6 +3723,7 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
+        else if (a == "--hold-expert-arena") o.hold_expert_arena = true;
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = o.resident_cpu_explicit = true;
         else if (a == "--resident-experts") {
             o.mmap_experts = o.resident_cpu_experts = o.resident_pin = o.resident_soft = true;
@@ -3770,6 +3779,94 @@ int main(int argc, char** argv) {
         const char* hv = std::getenv("STRATA_RESIDENT_HEADROOM_GIB");
         if (o.ram_keep > 0 && !(hv != nullptr && std::atof(hv) >= 0.0) && o.resident_headroom < o.ram_keep)
             o.resident_headroom = o.ram_keep;
+    }
+    // ---- --hold-expert-arena ("keep experts in RAM", opt-in): this process owns NOTHING but the shared expert arena.
+    // It runs here, before EVERY device query: the HIP arch-defaults block below asks the driver for its device
+    // properties, which creates a primary context and takes VRAM with it - exactly what a holder that exists to leave
+    // the card to another program must never do.  The pack's expert layout is its index, read from disk, so this needs
+    // no GPU at all: no context, no weight, no byte of VRAM exists while it waits.  It also runs before the checks on
+    // --tokens and --ple-gguf below, which a holder has no reason to satisfy - so nothing on the normal start path is
+    // touched at all, and without the flag the path is byte-identical to the last release.
+    // It opens the SAME arena (--shared-expert-arena) a later engine opens.  It reads the experts into it and marks
+    // the header's state word filled, or finds another process's filled arena and skips the read - the state word's
+    // protocol is expert_source.cpp's, the one the replicas and split serving already use.  It then keeps the mapping
+    // alive until stdin says QUIT or its stdin closes (how the server ends it), so the bytes stay in RAM across the
+    // serving engine starting, being unloaded to free the GPU, and starting again; that engine attaches to pages that
+    // are already there instead of reading tens of GiB off the disk again.
+    // Registration is deliberately NOT done here: the driver alias belongs to the process whose GPU needs it, and
+    // PinnedArena registers the pages it maps in every engine that attaches (a replica that starts second already
+    // proves registering already-filled shared pages works).  Forcing those two settings is the existing no-pin form
+    // (the integrated-GPU path takes it; STRATA_ARENA_LOCK=0 is its documented A/B arm), so this process neither
+    // cudaHostRegister's nor mlock's the arena - tmpfs pages and a Windows section are not trimmable anyway, and an
+    // mlock of tens of GiB would fail RLIMIT_MEMLOCK on a default Linux host.
+    if (o.hold_expert_arena) {
+        if (o.shared_expert_arena.empty()) {
+            std::fprintf(stderr, "strata generate: --hold-expert-arena needs --shared-expert-arena FILE: it holds the "
+                                 "arena another engine attaches to\n");
+            return 2;
+        }
+        if (o.mmap_experts) {
+            std::fprintf(stderr, "strata generate: --hold-expert-arena cannot be used with --mmap-experts\n");
+            return 2;
+        }
+#if defined(_WIN32)
+        _putenv_s("STRATA_ARENA_PIN_GIB", "none");   // this process has no GPU context to register for
+        _putenv_s("STRATA_ARENA_LOCK", "0");
+#else
+        (void) setenv("STRATA_ARENA_PIN_GIB", "none", 1);
+        (void) setenv("STRATA_ARENA_LOCK", "0", 1);
+#endif
+        std::string hold_err;
+        const strata::core::ModelGeometry hold_g;
+        if (!strata::kernels::cpu::expert_layout_load(o.pack, hold_g.n_layers, hold_g.n_expert, hold_err)) {
+            std::fprintf(stderr, "strata generate: hold expert arena: %s\n", hold_err.c_str());
+            return 1;
+        }
+        const auto& hold_lay = strata::kernels::cpu::expert_layout();
+        strata::core::ArenaExpertSource hold_src;
+        hold_src.set_gguf(o.native_preset);
+        const auto hold_t0 = std::chrono::steady_clock::now();
+        if (!hold_src.open(o.pack, hold_lay.n_layers, hold_lay.n_expert, /*threads=*/6, hold_err, 0,
+                           o.shared_expert_arena)) {
+            std::fprintf(stderr, "strata generate: hold expert arena: %s\n", hold_err.c_str());
+            return 1;
+        }
+        const double hold_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - hold_t0).count();
+        std::fprintf(stderr, "strata generate: expert arena: %s\n", hold_src.note().c_str());
+        std::fprintf(stderr, "strata generate: holding the expert arena in RAM: %.2f GiB read in %.1f s (%.2f GiB/s)\n",
+                     (double) hold_lay.total / (1024.0 * 1024.0 * 1024.0), hold_s, hold_src.load_gib_per_second());
+        std::fflush(stderr);
+        // The server waits for this line before it lets a request start an engine: an engine that attached while the
+        // arena was only half read would take the read over from the start, which is the one thing this avoids.
+        std::printf("ARENA READY %lld\n", (long long) hold_lay.total);
+        std::fflush(stdout);
+        // read(2) on the descriptor, never std::getline(std::cin): the reason the --serve stdin reader gives below.
+        // getline parks on stdin's lock and glibc's exit() flushes every stdio stream and waits for that lock, so
+        // ending this process would hang in exit() and the server would wait forever for a process still holding
+        // tens of GiB.  A blocking read on the main thread is enough: nothing else of this process runs meanwhile.
+        std::string hold_buf, hold_line;
+        char hold_chunk[4096];
+        bool hold_eof = false;
+        while (!hold_eof) {
+            const size_t nl = hold_buf.find('\n');
+            if (nl != std::string::npos) {
+                hold_line.assign(hold_buf, 0, nl);
+                hold_buf.erase(0, nl + 1);
+                if (!hold_line.empty() && hold_line.back() == '\r') hold_line.pop_back();
+                if (hold_line == "QUIT" || hold_line == "EXIT") break;  // an unknown line is ignored: a stray byte
+                continue;                                              //  must not free the RAM the server counts on
+            }
+#if defined(_WIN32)
+            const int n = _read(0, hold_chunk, (unsigned) sizeof hold_chunk);
+#else
+            const ssize_t n = ::read(0, hold_chunk, sizeof hold_chunk);
+            if (n < 0 && errno == EINTR) continue;
+#endif
+            if (n <= 0) hold_eof = true;   // the server closed our stdin: that is how it ends this process
+            else hold_buf.append(hold_chunk, (size_t) n);
+        }
+        std::fprintf(stderr, "strata generate: holding the expert arena: ended, the RAM goes back\n");
+        return 0;   // (closing hold_src unmaps it; the last mapping's end is what frees the pages)
     }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before

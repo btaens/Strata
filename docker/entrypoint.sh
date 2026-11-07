@@ -23,6 +23,11 @@
 #                 not serve beyond loopback without a key, so one is always on: yours, or one made on the first start and kept in /data.
 #   PRESET        preset name in /data (default "docker"). Settings above are saved into it; with no settings given a saved preset is reused.
 #   STRATA_SET    advanced engine settings, space separated KEY=VALUE (like `strata launch --set`)
+#   STRATA_KEEP_EXPERTS_IN_RAM  1: when the model unloads, its experts stay in system RAM, so the next load skips
+#                 reading tens of GB (docs/KEEP_RAM.md). Off by default. It is the server's setting, not an engine
+#                 one, so it is read here rather than passed through STRATA_SET. It pays only for an unload that
+#                 happens while the container keeps running - `POST /unload`, or "idle_unload_s" in the model's run
+#                 settings; `docker stop` gives the RAM back either way.
 set -u
 
 APP=/opt/strata

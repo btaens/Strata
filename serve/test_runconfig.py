@@ -65,6 +65,17 @@ class Apply(unittest.TestCase):
         with self.assertRaises(ValueError):
             runconfig.apply({**CFG, "vision": {"gpu": True}}, {"lazy_load": True})
 
+    def test_keep_experts_in_ram_is_a_plain_bool(self):
+        new, changed = runconfig.apply(CFG, {"keep_experts_in_ram": True})
+        self.assertEqual(changed, ["keep_experts_in_ram"])
+        self.assertIs(new["keep_experts_in_ram"], True)
+        self.assertEqual(new["args"], CFG["args"])                     # a server key, not an engine arg
+        back, _ = runconfig.apply(new, {"keep_experts_in_ram": None})
+        self.assertNotIn("keep_experts_in_ram", back)                  # null: the default (off) again
+        for changes in ({"keep_experts_in_ram": "yes"}, {"keep_experts_in_ram": 1}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                runconfig.apply(CFG, changes)
+
     def test_view(self):
         v = runconfig.view({**CFG, "args": CFG["args"] + ["--vram-reserve-mib", "1500"]}, "x/strata-q2_0.json")
         self.assertEqual(v["file"], "strata-q2_0.json")
