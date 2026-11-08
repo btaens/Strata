@@ -10223,8 +10223,17 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
             keep_arena, keep_note = ak.plan(cfg)
             print(f"[strata] {keep_note}", flush=True)
             if keep_arena:
+                # arena_numa_node (opt-in, Linux): the holder alone is told which CPU's RAM to fault the arena in
+                # (serve/arena_keep.py's note; src/program/generate.cpp's holder branch). The serving engines are
+                # deliberately not given it: they attach pages that already exist, and a mempolicy steers only new
+                # faults. Unset: the holder starts with the same environment as before.
+                numa_e, numa_note = ak.numa_env(cfg, ak.arena_bytes_for(cfg), gpus=gpu_list(cfg))
+                if numa_note:
+                    print(f"[strata] {numa_note}", flush=True)
+                    if not numa_e:                      # named but refused: the holder must not obey the raw env
+                        numa_e = {"STRATA_ARENA_NUMA_NODE": "off"}
                 arena_holder = ak.ArenaHolder(exe, engine_args(cfg, exe, announce=False), keep_arena,
-                                              cwd=cfg.get("cwd"), env=env, log=cfg.get("log"))
+                                              cwd=cfg.get("cwd"), env={**env, **numa_e}, log=cfg.get("log"))
                 try:
                     arena_holder.start()          # waits for ARENA READY: the read is the holder's, not the engine's
                 except Exception as e:            # noqa: BLE001 - the option never decides whether the server runs

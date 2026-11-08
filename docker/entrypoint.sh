@@ -27,7 +27,9 @@
 #                 reading tens of GB (docs/KEEP_RAM.md). Off by default. It is the server's setting, not an engine
 #                 one, so it is read here rather than passed through STRATA_SET. It pays only for an unload that
 #                 happens while the container keeps running - `POST /unload`, or "idle_unload_s" in the model's run
-#                 settings; `docker stop` gives the RAM back either way.
+#                 settings; `docker stop` gives the RAM back either way. On a two-CPU host, "arena_numa_node" (the
+#                 model's run settings, or STRATA_ARENA_NUMA_NODE in the environment) keeps that RAM beside the
+#                 card's CPU - docs/KEEP_RAM.md, "Two CPUs, one card".
 #   STRATA_LAZY_LOAD  1: the server answers with the model unloaded; the first request (or POST /load) loads it.
 #                 Off by default. The server reads it itself - it is not passed here - so it works the same for a
 #                 `strata launch` started any other way. A health check sees the model listed as "unloaded", so the

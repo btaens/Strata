@@ -242,6 +242,133 @@ def remove_arena(path: str | None) -> None:
         pass
 
 
+# ---- which CPU's RAM the arena sits in (opt-in; docs/KEEP_RAM.md, "two CPUs, one card") --------------------
+#
+# A two-socket PC places every first touch by the kernel's default rules, which spread a 48 GiB arena over both
+# sockets' memory; a card wired to one socket then crosses the link between the processors for part of every H2D
+# copy. "arena_numa_node": N (or "auto": the node the card's PCI slot sits on) asks the holder process to fault the
+# arena's pages on one node; the engine reads STRATA_ARENA_NUMA_NODE and calls set_mempolicy before it opens the
+# arena (src/program/generate.cpp, include/strata/core/arena_numa.hpp), and prints what move_pages says about the
+# pages after the read. The serving engines are NOT given the env: attaching maps pages that already exist, and a
+# mempolicy only steers new faults. Unset: no env, no line, exactly the old start. The engine's code reads the name
+# only in its holder branch (src/program/generate.cpp); a serving engine may inherit it and ignores it there.
+
+
+def _pci_gpu_nodes(sys_root: str = "/sys") -> list[int]:
+    """The NUMA node of each display card, in the order nvidia-smi numbers them (PCI address low to high - the
+    same order CUDA_DEVICE_ORDER=PCI_BUS_ID gives, which serve/server.py's child_env sets for every --gpu config;
+    the address parts compare as numbers, the way sorted lspci orders them). [] when sysfs cannot say. -1 in the
+    list: that card's sysfs entry has no node (a virtual GPU, a kernel that does not export it)."""
+    import glob
+    import re
+    base = os.path.join(sys_root, "bus", "pci", "devices")
+    if not os.path.isdir(base):
+        return []
+    # a sysfs entry name is domain:bus:device.function, all hex; the domain may be absent in a stripped tree
+    pat = re.compile(r"(?:([0-9a-fA-F]{4}):)?([0-9a-fA-F]{2}):([0-9a-fA-F]{2})\.([0-9a-fA-F])$")
+    devices: dict[tuple[int, int, int, int], int] = {}
+    for d in glob.glob(os.path.join(base, "*")):
+        m = pat.match(os.path.basename(d))
+        if m is None:
+            continue
+        key = tuple(int(g if g is not None else "0", 16) for g in m.groups())
+        try:
+            with open(os.path.join(d, "class"), encoding="ascii") as f:
+                if not f.read().strip().startswith("0x03"):
+                    continue                      # not a display controller (0x03: VGA, 3D, other)
+        except OSError:
+            continue
+        node = -1
+        try:
+            with open(os.path.join(d, "numa_node"), encoding="ascii") as f:
+                t = f.read().strip()
+                node = int(t) if t.lstrip("-").isdigit() else -1
+        except OSError:
+            pass
+        devices[key] = node
+    return [devices[k] for k in sorted(devices)]
+
+
+def node_mem_free(node: int, sys_root: str = "/sys") -> int:
+    """MemFree of one NUMA node in bytes, or 0 when it cannot be read (a one-node kernel that exports no node
+    folder: 0 lets the caller treat it as unknown, not as full)."""
+    try:
+        with open(os.path.join(sys_root, "devices", "system", "node", f"node{node}", "meminfo"),
+                  encoding="ascii") as f:
+            for line in f:                      # the kernel's lines read "Node 0 MemFree:   26340584 kB"
+                parts = line.split()
+                if len(parts) >= 3 and "MemFree:" in parts:
+                    return int(parts[parts.index("MemFree:") + 1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def numa_env(cfg: dict, arena_bytes: int, *, environ=None, sys_root: str = "/sys",
+             platform: str | None = None, gpus=None) -> tuple[dict, str]:
+    """(the environment to add for the holder, one line to print - {} and "" when the option is off). The config's
+    "arena_numa_node" (an int, or "auto" for the card's node, or "off") wins over STRATA_ARENA_NUMA_NODE in the
+    environment. `gpus`: the card numbers the engine is given - serve/server.py passes its gpu_list(cfg), which is
+    the roles order when the person set roles; cfg["gpu"] is the fallback. A node the arena does not fit in is
+    refused here, at the server's start, where a refusal costs nothing; a caller that got {} with a note while the
+    environment names a node must pass "off" to the holder, so the environment's raw value cannot reach the engine
+    past the guard. A kernel that later refuses the syscall still places by default, and the holder's own line
+    says so."""
+    environ = os.environ if environ is None else environ
+    platform = ("win32" if os.name == "nt" else sys.platform) if platform is None else platform
+    if not platform.startswith("linux"):
+        return {}, ""
+    v = cfg.get("arena_numa_node") if isinstance(cfg, dict) else None
+    if v is None:
+        v = (environ.get("STRATA_ARENA_NUMA_NODE") or "").strip() or None
+    if isinstance(v, bool) or v is None or (isinstance(v, str) and not v.strip()):
+        return {}, ""                             # empty too: the app's text field cleared is the default
+    if isinstance(v, str) and v.strip().lower() in ("off", "none", "default"):
+        # a config that names "off" wins over the environment's number: the holder must not inherit a raw
+        # STRATA_ARENA_NUMA_NODE past the config's refusal (child_env copies the server's own environment). An
+        # environment that already says off needs no override.
+        if environ.get("STRATA_ARENA_NUMA_NODE", "").strip().isdigit():
+            return {"STRATA_ARENA_NUMA_NODE": "off"}, ""
+        return {}, ""
+    node: int | None = None
+    if isinstance(v, str) and v.strip().lower() == "auto":
+        cards = _pci_gpu_nodes(sys_root)
+        g = cfg.get("gpu") if gpus is None else gpus
+        items = list(g) if isinstance(g, (list, tuple)) else ([] if g in (None, "") else str(g).split(","))
+        try:
+            gpus = [int(str(x).strip()) for x in items if str(x).strip() != ""]
+        except ValueError:
+            gpus = []                                   # a card named by UUID: not a number to index sysfs by
+        if not gpus:
+            return {}, ("arena NUMA: 'auto' needs the model to name a card (the GPU settings); the arena is placed "
+                        "by the kernel as before")
+        nodes = [cards[g] for g in gpus if 0 <= g < len(cards) and cards[g] >= 0]
+        if not nodes:
+            return {}, (f"arena NUMA: 'auto' cannot tell which CPU the card sits on (sysfs names "
+                        f"{len(cards)} display card(s), the model asks for {gpus}); the arena is placed by the "
+                        "kernel as before")
+        node = nodes[0]
+        if len(set(nodes)) > 1:
+            return {}, (f"arena NUMA: the layer split uses cards on nodes {' and '.join(str(n) for n in dict.fromkeys(nodes))};"
+                        " one arena node cannot serve both - name arena_numa_node with one of them or leave it off")
+    elif isinstance(v, int) or (isinstance(v, str) and v.strip().isdigit()):
+        node = int(v)
+    else:
+        return {}, f"arena NUMA: {v!r} is not a node number, 'auto' or 'off'; the arena is placed by the kernel as before"
+    if not 0 <= node <= 63:
+        return {}, f"arena NUMA: node {node} is out of 0..63; the arena is placed by the kernel as before"
+    need = arena_bytes + int(2 * (1 << 30))      # the arena beside what the node already carries
+    free = node_mem_free(node, sys_root)
+    if free and free < need:
+        return {}, (f"arena NUMA: node {node} has {free / 2**30:.1f} GiB free and the arena is "
+                    f"{arena_bytes / 2**30:.1f} GiB; the arena is placed by the kernel as before (the whole arena "
+                    "on one CPU's RAM would not fit)")
+    return {"STRATA_ARENA_NUMA_NODE": str(node)}, (
+        f"the arena's RAM goes to NUMA node {node}" + ("" if free else " (this kernel does not say how much the node "
+        "has free; the engine's own line after the read says where the pages landed)") + ": the card reaches it "
+        "without crossing the link between the CPUs")
+
+
 class ArenaHolder:
     """One engine process whose only job is to own the arena: started at the server's start, watched, and started
     again if it dies (its RAM going back is the failure the option exists to avoid). It reads the experts once, prints

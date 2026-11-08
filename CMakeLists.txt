@@ -2847,6 +2847,21 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(numa_pool_test PRIVATE include)
   target_compile_features(numa_pool_test PRIVATE cxx_std_17)
   add_test(NAME numa_pool_test COMMAND numa_pool_test)
+  # the held expert arena's NUMA placement helpers (env number, set_mempolicy accept/refuse, the report's arithmetic;
+  # docs/KEEP_RAM.md "two CPUs, one card"; a sandbox that refuses the syscalls is a pass with the refusal printed).
+  # Linux only: the syscall paths are #ifdef __linux__ there, as in pinned.cu's arena.
+  if(NOT WIN32)
+    add_executable(arena_numa_test src/core/arena_numa_test.cpp)
+    target_include_directories(arena_numa_test PRIVATE include)
+    target_compile_features(arena_numa_test PRIVATE cxx_std_17)
+    add_test(NAME arena_numa_test COMMAND arena_numa_test)
+  endif()
+  # keeping the held expert arena beside the card's CPU (header-only helpers; a sandbox that refuses the
+  # syscalls is a pass - the engine treats the same refusal as "not verified" and places by default)
+  add_executable(arena_numa_test src/core/arena_numa_test.cpp)
+  target_include_directories(arena_numa_test PRIVATE include)
+  target_compile_features(arena_numa_test PRIVATE cxx_std_17)
+  add_test(NAME arena_numa_test COMMAND arena_numa_test)
   # #3204: when the HIP start-up warm-up of hipBLAS may run (pure policy, no GPU)
   add_executable(warm_policy_test src/prefill/warm_policy_test.cpp)
   target_include_directories(warm_policy_test PRIVATE include)

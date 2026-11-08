@@ -85,6 +85,54 @@ The 12 GiB is the operating system, the server and the engine's own RAM kept abo
 per quant is the measured figure in [strata_control/replica_profile.py](../strata_control/replica_profile.py):
 50.3 GiB IQ3_S, 42.9 GiB IQ3_XXS, 34.0 GiB Q2_0.
 
+## Two CPUs, one card
+
+A two-socket PC (two Xeon or EPYC packages, a PowerEdge T430, an HP Z840) has its memory in two groups, one per CPU.
+The kernel places a fresh page by the CPU that first touches it, and its threads run wherever the scheduler likes -
+so a 48 GiB expert arena read by the holder lands partly on one CPU's memory and partly on the other's. The graphics
+card is wired to one of the two slots groups; when it copies an expert from the far half, the data crosses the link
+between the processors on the way. `arena_numa_node` puts the whole arena on the near side:
+
+```json
+"keep_experts_in_ram": true,
+"arena_numa_node": "auto"
+```
+
+`"auto"` picks the NUMA node the card's PCI slot sits on (read from `/sys`); a plain number (`0` or `1`) names one.
+The server resolves it and starts only the **holder** with `STRATA_ARENA_NUMA_NODE`; the holder asks the kernel
+(`set_mempolicy`, no special rights needed) to fault the arena's pages on that node, and its read threads inherit
+that. The serving engines are deliberately not told: attaching maps pages that already exist, and the policy steers
+only new faults. After the read the holder prints what actually happened:
+
+```
+strata generate: expert arena: new pages go to NUMA node 1
+strata generate: NUMA placement: 96 of 96 sampled pages on node 1 (100.0%; ~50.30 of 50.30 GiB beside that CPU)
+```
+
+If the node's free RAM cannot hold the arena, the server says so at its start and places by the kernel as before; if
+the kernel refuses the request (a sandbox), the holder prints the reason and places by the kernel too. Nothing here
+fails a start. The ask is "preferred", not "strict", on purpose: a strict bind over 48 GiB would kill the holder with
+SIGBUS the moment the node ran out, which is the one failure this option must never cause.
+
+Why it matters only for the copy path: with the arena kept, a reload's expert read is a `memcpy`-speed step, and the
+served cache fills go `cudaMemcpyAsync` straight from the arena's pages, which every engine registers pinned when it
+attaches - there is no staging copy to remove. What is left to place well is where the pages sit relative to the
+card's slot.
+
+**What was measured.** A whole-engine `numactl` A/B on the same class of machine (an HP Z840, dual Xeon E5-2699 v3,
+RTX 3090 Ti on node 0, PCIe 3.0; [community results](../bench/results/2026-10-03-community-z840-rtx3090ti)): node-0
+memory plus node-0 threads loaded the model in 32 s against 36 s unbound and 42 s interleaved, and decoded at 94.9
+tok/s against 90.1 unbound (1304 against 1268 prompt tok/s). That A/B bound the whole engine, not this option's
+holder, so treat it as the size of the effect on that class of board, not as this option's number - this exact path
+(holder-only placement, engines unbound) has not been measured end to end, and the line above is how you check it on
+your own box. The card side has a hard floor either way: PCIe 3.0 x16 measured 12.4 GB/s on that Z840 (the engine's
+own probe), which is about 3.9 s to fill 48 GiB whatever the memory's node; the placement removes the crossings
+inside that window, not the window.
+
+Not offered: binding the arena with hugepages, or moving pages after the fact (`mbind` needs rights the server does
+not take). One card per arena node is assumed; a layer split whose cards sit on different nodes is refused for
+`"auto"` and left to a named number.
+
 ## What still costs time on every reload
 
 The experts are the biggest part of the read, not the whole start. A reload still makes its CUDA context, reads

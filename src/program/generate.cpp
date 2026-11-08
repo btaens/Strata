@@ -44,6 +44,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/core/arena_numa.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/uma_cache.hpp"
 #include "strata/core/remote_experts.hpp"
@@ -3816,6 +3817,20 @@ int main(int argc, char** argv) {
         (void) setenv("STRATA_ARENA_PIN_GIB", "none", 1);
         (void) setenv("STRATA_ARENA_LOCK", "0", 1);
 #endif
+#if defined(__linux__)
+        // STRATA_ARENA_NUMA_NODE=N (opt-in, unset = byte-identical default): fault the arena's pages beside the
+        // CPU the card is wired to, so a served H2D copy reads them without crossing the link between the CPUs.
+        // This process is the only one that faults the pages - a serving engine that attaches takes the pages
+        // as they already are - so the policy belongs here alone.  set_mempolicy needs no privilege; a kernel
+        // that refuses it (a sandbox) leaves placement to the default and says so.
+        if (const int numa_node = strata::core::arena_numa_node_from_env(std::getenv("STRATA_ARENA_NUMA_NODE"));
+            numa_node >= 0) {
+            if (const std::string nerr = strata::core::arena_numa_bind(numa_node); !nerr.empty())
+                std::fprintf(stderr, "strata generate: arena NUMA node %d not set: %s\n", numa_node, nerr.c_str());
+            else
+                std::fprintf(stderr, "strata generate: expert arena: new pages go to NUMA node %d\n", numa_node);
+        }
+#endif
         std::string hold_err;
         const strata::core::ModelGeometry hold_g;
         if (!strata::kernels::cpu::expert_layout_load(o.pack, hold_g.n_layers, hold_g.n_expert, hold_err)) {
@@ -3835,6 +3850,24 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert arena: %s\n", hold_src.note().c_str());
         std::fprintf(stderr, "strata generate: holding the expert arena in RAM: %.2f GiB read in %.1f s (%.2f GiB/s)\n",
                      (double) hold_lay.total / (1024.0 * 1024.0 * 1024.0), hold_s, hold_src.load_gib_per_second());
+#if defined(__linux__)
+        // Where the pages actually went (see arena_numa.hpp): sample a stride of blob addresses and ask the
+        // kernel which node holds each.  A refused sample prints "not verified"; nothing here fails the start.
+        if (const int numa_node = strata::core::arena_numa_node_from_env(std::getenv("STRATA_ARENA_NUMA_NODE"));
+            numa_node >= 0) {
+            std::vector<void*> numa_pages;
+            const int64_t stride = std::max<int64_t>(1, (hold_lay.n_layers * hold_lay.n_expert) / 96);
+            for (int64_t i = 0; i < hold_lay.n_layers * hold_lay.n_expert; i += stride)
+                if (const uint8_t* b = hold_src.blob_at(i / hold_lay.n_expert, i % hold_lay.n_expert);
+                    b != nullptr)
+                    numa_pages.push_back(const_cast<void*>((const void*) b));
+            std::vector<int> numa_status;
+            const int numa_err = strata::core::arena_numa_sample(numa_pages, numa_status);
+            std::fprintf(stderr, "strata generate: %s\n",
+                         strata::core::arena_numa_report_text(numa_status, numa_node, numa_err,
+                                                              (long long) hold_lay.total).c_str());
+        }
+#endif
         std::fflush(stderr);
         // The server waits for this line before it lets a request start an engine: an engine that attached while the
         // arena was only half read would take the read over from the start, which is the one thing this avoids.

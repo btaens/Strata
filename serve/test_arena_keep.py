@@ -2,7 +2,8 @@
 
 Two things are tested: the plan (who may keep an arena, and the RAM budget guard that refuses before anything is
 spent), and the holder's lifecycle against a fake engine that speaks the protocol src/program/generate.cpp's
---hold-expert-arena speaks - ARENA READY on stdout, then the end on stdin's EOF or QUIT."""
+--hold-expert-arena speaks - ARENA READY on stdout, then the end on stdin's EOF or QUIT. A third part tests the
+arena's NUMA placement (numa_env) against a fake /sys tree: no real sysfs, no syscall."""
 import os
 import shutil
 import sys
@@ -240,6 +241,130 @@ class Holder(unittest.TestCase):
         remove_arena(None)
         remove_arena("win:Local\\strata-keep-1")
         remove_arena(os.path.join(self.tmp.name, "gone.bin"))
+
+
+class NumaPlacement(unittest.TestCase):
+    """numa_env: the holder-only STRATA_ARENA_NUMA_NODE the keeper adds (serve/arena_keep.py), tested against a
+    fake /sys tree - no real sysfs, no syscall. Unset must stay {} and "": without the key the holder is started
+    with exactly the environment it was before."""
+
+    GIB = 2**30
+
+    def sysfs(self, d: str, cards: list[tuple[str, str, str]], nodes: dict[int, int | None]) -> str:
+        """A fake /sys: `cards` = (pci address, class, numa_node or "") in creation order (the helper must sort),
+        `nodes` = {node: MemFree KiB or None for no folder}."""
+        for addr, cls, node in cards:
+            p = os.path.join(d, "bus", "pci", "devices", f"0000:{addr}")
+            os.makedirs(p)
+            with open(os.path.join(p, "class"), "w", encoding="ascii") as f:
+                f.write(cls + "\n")
+            if node != "":
+                with open(os.path.join(p, "numa_node"), "w", encoding="ascii") as f:
+                    f.write(node + "\n")
+        for n, free_kib in nodes.items():
+            if free_kib is None:
+                continue
+            p = os.path.join(d, "devices", "system", "node", f"node{n}")
+            os.makedirs(p)
+            with open(os.path.join(p, "meminfo"), "w", encoding="ascii") as f:
+                f.write(f"Node {n} MemTotal:       131954300 kB\n"
+                        f"Node {n} MemFree:        {free_kib} kB\n"
+                        f"Node {n} MemUsed:        100 kB\n")
+        return d
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_auto_names_the_node_of_the_named_card(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1"), ("00:01.0", "0x030200", "0")],
+                       {0: 100 * 1024 * 1024, 1: 100 * 1024 * 1024})
+        # the fake lists the node-1 card first: the helper must still number them by PCI address, node 0 first
+        env, note = ak.numa_env({"arena_numa_node": "auto", "gpu": 1}, 48 * self.GIB, environ={}, sys_root=s,
+                                platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "1"})
+        self.assertIn("NUMA node 1", note)
+        env, note = ak.numa_env({"arena_numa_node": "auto", "gpu": [0, 1]}, 48 * self.GIB, environ={}, sys_root=s,
+                                platform="linux")
+        self.assertEqual(env, {})                             # a split across two nodes: no single node for "auto"
+        self.assertIn("one arena node cannot serve both", note)
+
+    def test_only_display_cards_count(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1"), ("00:17.0", "0x010601", "0")],
+                       {0: 100 * 1024 * 1024, 1: 100 * 1024 * 1024})
+        env, _ = ak.numa_env({"arena_numa_node": "auto", "gpu": 0}, 48 * self.GIB, environ={}, sys_root=s,
+                             platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "1"})    # the SATA controller is not a card
+
+    def test_the_config_number_beats_the_environment(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {0: 100 * 1024 * 1024, 1: 100 * 1024 * 1024})
+        cfg = {"arena_numa_node": 0, "gpu": 0}
+        env, _ = ak.numa_env(cfg, 48 * self.GIB, environ={"STRATA_ARENA_NUMA_NODE": "1"}, sys_root=s,
+                             platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "0"})
+        env, _ = ak.numa_env({"gpu": 0}, 48 * self.GIB, environ={"STRATA_ARENA_NUMA_NODE": "1"}, sys_root=s,
+                             platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "1"})    # no config key: the environment's turn
+
+    def test_off_and_unset_place_nothing(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {0: 100 * 1024 * 1024})
+        for cfg, environ in (({"arena_numa_node": "off"}, {}), ({"arena_numa_node": None}, {"STRATA_ARENA_NUMA_NODE": "off"}),
+                             ({}, {}), ({}, {"STRATA_ARENA_NUMA_NODE": ""})):
+            self.assertEqual(ak.numa_env(cfg, 48 * self.GIB, environ=environ, sys_root=s, platform="linux"),
+                             ({}, ""))
+
+    def test_off_in_the_config_overrides_an_inherited_environment_number(self):
+        # child_env copies the server's own environment to the holder: a config that says "off" has to silence a
+        # raw STRATA_ARENA_NUMA_NODE the server happens to carry, not just ignore it
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {0: 100 * 1024 * 1024, 1: 100 * 1024 * 1024})
+        env, note = ak.numa_env({"arena_numa_node": "off"}, 48 * self.GIB,
+                                environ={"STRATA_ARENA_NUMA_NODE": "1"}, sys_root=s, platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "off"})   # the holder reads "off" as off, never as node 1
+        self.assertEqual(note, "")
+
+    def test_a_node_the_arena_does_not_fit_in_is_refused_with_both_numbers(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {0: 40 * 1024 * 1024, 1: 20 * 1024 * 1024})
+        env, note = ak.numa_env({"arena_numa_node": 1, "gpu": 0}, 48 * self.GIB, environ={}, sys_root=s,
+                                platform="linux")
+        self.assertEqual(env, {})
+        self.assertIn("node 1 has 20.0 GiB free", note)
+        self.assertIn("the arena is 48.0 GiB", note)
+        self.assertIn("as before", note)                          # the sentence ends in what still happens
+
+    def test_a_node_that_cannot_say_how_much_it_has_goes_on_with_a_note(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {})   # no node folders at all
+        env, note = ak.numa_env({"arena_numa_node": 1}, 48 * self.GIB, environ={}, sys_root=s, platform="linux")
+        self.assertEqual(env, {"STRATA_ARENA_NUMA_NODE": "1"})       # unknown free: the holder's own line tells later
+        self.assertIn("does not say how much the node has free", note)
+
+    def test_auto_needs_a_card_and_a_sysfs_that_can_answer(self):
+        s = self.sysfs(self.d, [], {})
+        env, note = ak.numa_env({"arena_numa_node": "auto"}, 48 * self.GIB, environ={}, sys_root=s, platform="linux")
+        self.assertEqual(env, {})
+        self.assertIn("'auto' needs the model to name a card", note)
+        env, note = ak.numa_env({"arena_numa_node": "auto", "gpu": 3}, 48 * self.GIB, environ={}, sys_root=s,
+                                platform="linux")
+        self.assertEqual(env, {})
+        self.assertIn("0 display card(s)", note)
+        s2 = self.sysfs(tempfile.mkdtemp(dir=self.d), [("05:00.0", "0x030000", "-1")], {})
+        env, note = ak.numa_env({"arena_numa_node": "auto", "gpu": 0}, 48 * self.GIB, environ={}, sys_root=s2,
+                                platform="linux")
+        self.assertEqual(env, {})
+        self.assertIn("cannot tell which CPU the card sits on", note)
+
+    def test_a_value_that_is_not_a_node_says_so_and_places_as_before(self):
+        s = self.sysfs(self.d, [("05:00.0", "0x030000", "1")], {0: 100 * 1024 * 1024, 1: 100 * 1024 * 1024})
+        for v in ("banana", 64, -1):
+            env, note = ak.numa_env({"arena_numa_node": v}, 48 * self.GIB, environ={}, sys_root=s, platform="linux")
+            self.assertEqual(env, {})
+            self.assertIn("as before", note)
+
+    def test_windows_and_mac_get_nothing(self):
+        for plat in ("win32", "darwin"):
+            self.assertEqual(ak.numa_env({"arena_numa_node": 0}, 48 * self.GIB, environ={}, sys_root=self.d,
+                                          platform=plat), ({}, ""))
 
 
 class UnloadSaysWhatIsKept(unittest.TestCase):

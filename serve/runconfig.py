@@ -17,8 +17,9 @@ from pathlib import Path
 from strata_control import user_args
 from strata_control import atomic as _atomic_mod
 
-# (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
-# of the "sampling" block, ("arg", flag) for an engine option kept in "args".
+# (key, kind, help).  kind: "bool", "int>=0", "num>=0", "node" (a NUMA node: an int 0..63, "auto" or "off"),
+# ("enum", values), "names", or ("sampling", check) for a key of the "sampling" block, ("arg", flag) for an engine
+# option kept in "args".
 EDITABLE = [
     ("sampling.temperature", ("sampling", "num>=0"),
      "Default temperature for requests that send none (0 = greedy; without it the model card's: 1.0 thinking, 0.7 not)"),
@@ -36,6 +37,9 @@ EDITABLE = [
     ("keep_experts_in_ram", "bool",
      "Keep the experts in system RAM between unloads (opt-in): a reload starts without reading them from the disk "
      "again; the RAM stays used while the graphics card is free"),
+    ("arena_numa_node", "node",
+     "Two-CPU PCs, with keep_experts_in_ram: keep the arena's RAM beside one CPU (a node number, or \"auto\" for the "
+     "card's CPU) so the card reaches it without crossing the link between the CPUs; empty: the system places it"),
     ("mtp", "bool", "Draft layer (MTP): off starts the engine without it (about 1 GB less graphics memory, slower words per second); "
                     "empty or on: as installed"),
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
@@ -114,6 +118,16 @@ def check(key: str, v, cfg: dict):
         return _number(key, v, whole=True)
     if k == "num>=0":
         return _number(key, v)
+    if k == "node":                                      # a NUMA node: an int 0..63, "auto", or "off"
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("auto", "off"):
+                return s
+            if s.isdigit():
+                v = int(s)
+        if isinstance(v, bool) or not isinstance(v, int) or not 0 <= v <= 63:
+            raise ValueError(f"{key}: expected a node number 0-63, 'auto' or 'off', not {v!r}")
+        return v
     if k == "arg":
         return _number(key, v, whole=True)
     rule = kind[1]                                     # a sampling key: the server's own rules

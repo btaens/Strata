@@ -76,6 +76,17 @@ class Apply(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 runconfig.apply(CFG, changes)
 
+    def test_arena_numa_node_is_a_number_auto_or_off(self):
+        for v, want in ((1, 1), ("1", 1), ("auto", "auto"), ("off", "off"), (0, 0), ("0", 0)):
+            new, _ = runconfig.apply(CFG, {"arena_numa_node": v})
+            self.assertEqual(new["arena_numa_node"], want)             # a number stays a number in the file
+        back, _ = runconfig.apply({**CFG, "arena_numa_node": 1}, {"arena_numa_node": None})
+        self.assertNotIn("arena_numa_node", back)                      # null: the system places it again
+        for changes in ({"arena_numa_node": "banana"}, {"arena_numa_node": 64}, {"arena_numa_node": -1},
+                        {"arena_numa_node": True}, {"arena_numa_node": 1.5}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                runconfig.apply(CFG, changes)
+
     def test_view(self):
         v = runconfig.view({**CFG, "args": CFG["args"] + ["--vram-reserve-mib", "1500"]}, "x/strata-q2_0.json")
         self.assertEqual(v["file"], "strata-q2_0.json")
