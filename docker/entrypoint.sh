@@ -28,6 +28,15 @@
 #                 one, so it is read here rather than passed through STRATA_SET. It pays only for an unload that
 #                 happens while the container keeps running - `POST /unload`, or "idle_unload_s" in the model's run
 #                 settings; `docker stop` gives the RAM back either way.
+#   STRATA_LAZY_LOAD  1: the server answers with the model unloaded; the first request (or POST /load) loads it.
+#                 Off by default. The server reads it itself - it is not passed here - so it works the same for a
+#                 `strata launch` started any other way. A health check sees the model listed as "unloaded", so the
+#                 container turns green before anything is loaded.
+#   STRATA_IDLE_UNLOAD_S  seconds without a request after which the model unloads and the card is free for other
+#                 programs; the next request loads it again (0 or unset: never). The model's run settings (the
+#                 Settings card) win over this, and `--idle-unload` wins over both.
+#   STRATA_DISABLE_WEBUI  1: no web page: /, /api-monitor, /web/* and /fonts/* answer 404. The API (/v1/*), /health
+#                 and the health check stay as they are. Off by default.
 set -u
 
 APP=/opt/strata

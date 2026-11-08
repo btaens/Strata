@@ -527,6 +527,28 @@ def unload_wait(value, default: float) -> float:
         return default
 
 
+def env_flag(name: str) -> bool:
+    """An environment opt-in, the way a container sets one (docs/DOCKER.md): 1 / true / yes / on is on, anything
+    else - including the name being unset - is off. Used for the three start-time settings a person sets once with
+    `docker run -e` and never changes per request (STRATA_LAZY_LOAD, STRATA_DISABLE_WEBUI; the idle unload's
+    seconds go through env_seconds). A run config key or a command-line flag wins over these; they are the fallback
+    for a start that has no config to edit."""
+    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_seconds(name: str) -> float | None:
+    """An environment setting in seconds (STRATA_IDLE_UNLOAD_S): the number, or None when unset or empty. A value
+    that is not a number stops the start naming the variable and what it said: a typo in a container's -e should
+    read as that, not as a traceback in a log."""
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        raise SystemExit(f"[strata] {name}={raw!r} is not a number of seconds") from None
+
+
 ENGINE_REQUEST = re.compile(
     # "+ 12288 of 98179 read": a request cancelled while its prompt was read (#471)
     r"prompt (?P<prompt>\d+) tokens = (?P<reused>\d+) reused \+ \d+(?: of \d+)? read in (?P<read>[\d.]+) ms "
@@ -4821,6 +4843,9 @@ class Service:
         # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
         self.api_monitor = False
         self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
+        # the web page and its files (/, /api-monitor, /web/*, /fonts/*) are served unless this is off: an API-only
+        # server answers 404 for those and keeps /v1/* as it is (STRATA_DISABLE_WEBUI, docs/DOCKER.md)
+        self.webui = True
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -7779,6 +7804,12 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if not svc.webui and (path in ("", "/api-monitor") or path.startswith(("/web/", "/fonts/"))):
+                # one guard for the whole page: its html, its scripts and styles, its translations, its fonts. The
+                # data under /api/* and /v1/* is untouched - "no web page" removes the browser's surface, not an
+                # operator's or a client's (serve/web/monitor.js is the only reader of what these serve)
+                self._json(404, {"error": {"message": "the web page is off on this server"}})
+                return
             if path.startswith("/tool-media/"):
                 if not self._authorized():
                     return
@@ -10112,7 +10143,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
-        lazy = a.lazy or cfg.get("lazy_load") is True
+        lazy = a.lazy or cfg.get("lazy_load") is True or env_flag("STRATA_LAZY_LOAD")
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
@@ -10329,7 +10360,12 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
-    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(
+        cfg.get("idle_unload_s") or env_seconds("STRATA_IDLE_UNLOAD_S") or 0)
+    svc.webui = not env_flag("STRATA_DISABLE_WEBUI")
+    if not svc.webui:
+        print("[strata] the web page is off (STRATA_DISABLE_WEBUI): /, /api-monitor, /web/* and /fonts/* answer 404; "
+              "the API stays as it is", flush=True)
     svc.arena_holder = arena_holder                   # --keep-experts-in-ram: what an unload keeps in RAM (None: off)
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
@@ -10428,7 +10464,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     print(f"ready: http://{here}:{bound_port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
-    print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model", flush=True)
+    print(f"       open http://{here}:{bound_port}/ in a browser to chat; close this window to stop the model"
+          if svc.webui else
+          f"       the web page is off: the model is at http://{here}:{bound_port}/v1", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
         ips = [f"[{a.host}]"] if ":" in a.host and a.host != "::" else [] if a.host == "::" else lan_addresses()

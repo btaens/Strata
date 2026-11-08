@@ -129,6 +129,9 @@ screens; leave out what you do not care about.
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
 | `STRATA_KEEP_EXPERTS_IN_RAM` | `1`: when the model unloads, its experts stay in system RAM, so the next load skips reading them from the disk (39.97 GiB took 19-20 s at 6.40 GiB/s). The GPU is given back either way. Needs the experts' RAM plus about 12 GiB free. It pays only for an unload while the container keeps running - `POST /unload`, or `idle_unload_s` in the model's run settings (the Settings card); `docker stop` gives the RAM back in both cases, so on its own this option only holds memory. [KEEP_RAM.md](KEEP_RAM.md) | off |
+| `STRATA_LAZY_LOAD` | `1`: the server starts with the model unloaded; the first request (or `POST /load`) loads it. The health check stays green: `/v1/models` lists the model as `unloaded` | off |
+| `STRATA_IDLE_UNLOAD_S` | seconds without a request after which the model unloads and the card is free for other programs; the next request loads it again. The model's run settings (`idle_unload_s`, the Settings card) win over this | never |
+| `STRATA_DISABLE_WEBUI` | `1`: no web page - `/`, `/api-monitor`, `/web/*` and `/fonts/*` answer 404. The API (`/v1/*`), `/health` and the health check stay as they are | off |
 
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new
