@@ -23,6 +23,13 @@
 #                 not serve beyond loopback without a key, so one is always on: yours, or one made on the first start and kept in /data.
 #   PRESET        preset name in /data (default "docker"). Settings above are saved into it; with no settings given a saved preset is reused.
 #   STRATA_SET    advanced engine settings, space separated KEY=VALUE (like `strata launch --set`)
+#   WARM          1: unloading (IDLE_UNLOAD, POST /unload) parks the model in RAM instead of ending the engine: the card's memory is free, the next
+#                 request restores it in seconds. NVIDIA only, driver 570+, needs NVIDIA's cuda-checkpoint (CUDA_CHECKPOINT, or on the PATH)
+#   IDLE_UNLOAD   unload (with WARM: park) the model after this many seconds without requests (empty or 0: never)
+#   LAZY_LOAD     1: start the server without the model; the first request loads it (with WARM: the model loads, then parks)
+#   CUDA_CHECKPOINT  path of the cuda-checkpoint program inside the container (default: the one on the PATH)
+#   The last four are read by the server from its environment (STRATA_WARM, STRATA_IDLE_UNLOAD_S, STRATA_LAZY_LOAD, STRATA_CUDA_CHECKPOINT);
+#   a command-line flag beats them, and they beat the run config's keys of the same meaning.
 set -u
 
 APP=/opt/strata
@@ -224,6 +231,39 @@ if [ -n "$roles" ]; then
 fi
 [ -n "${STRATA_SET:-}" ] && { for kv in $STRATA_SET; do set -- "$@" --set "$kv"; done; have=1; }
 [ -n "$key" ] && { set -- "$@" --api-key-env STRATA_LAUNCH_KEY; }
+
+# ---- server behaviour that is not a `launch` flag: serve/server.py reads it from its environment, which the launch hands on
+bool_env() {   # $1: the variable of this image, $2: the one the server reads
+  eval "val=\${$1:-}"
+  [ -n "$val" ] || return 0
+  case "$(printf '%s' "$val" | tr 'A-Z' 'a-z')" in
+    1|true|on|yes) export "$2=1" ;;
+    0|false|off|no) export "$2=0" ;;
+    *) die "$1=$val is not 1 or 0." 2 ;;
+  esac
+}
+bool_env WARM STRATA_WARM
+bool_env LAZY_LOAD STRATA_LAZY_LOAD
+if [ -n "${IDLE_UNLOAD:-}" ]; then
+  case "$IDLE_UNLOAD" in *[!0-9.]*) die "IDLE_UNLOAD=$IDLE_UNLOAD is not a number of seconds." 2 ;; esac
+  export STRATA_IDLE_UNLOAD_S="$IDLE_UNLOAD"
+fi
+[ -n "${CUDA_CHECKPOINT:-}" ] && export STRATA_CUDA_CHECKPOINT="$CUDA_CHECKPOINT"
+if [ "${STRATA_WARM:-0}" = 1 ]; then      # said now, not when the first unload falls back: a warning, never a refusal
+  ck="${STRATA_CUDA_CHECKPOINT:-$(command -v cuda-checkpoint 2>/dev/null || true)}"
+  if [ "$backend" != cuda ]; then
+    warn "WARM=1 needs an NVIDIA card; this engine ($backend) unloads as usual."
+  elif [ -z "$ck" ] || [ ! -x "$ck" ]; then
+    warn "WARM=1 needs NVIDIA's cuda-checkpoint, which is not at CUDA_CHECKPOINT or on the PATH (the cuda image has it unless it was built with --no-cuda-checkpoint; or mount the program and set CUDA_CHECKPOINT). Until then the model is unloaded as usual."
+  else
+    # cuda-checkpoint looks for /dev/char/195:N -> ../nvidiaN and fails where a container has /dev/nvidiaN but no such links (NVIDIA/cuda-checkpoint#58)
+    for node in "$dev"/nvidia[0-9]*; do
+      [ -e "$node" ] || continue
+      n=${node##*/nvidia}
+      [ -e "$dev/char/195:$n" ] || { mkdir -p "$dev/char" && ln -s "../nvidia$n" "$dev/char/195:$n"; } 2>/dev/null || true
+    done
+  fi
+fi
 
 # tune once: ask only when this preset has not been tuned yet (a restart must not tune again for 20 minutes)
 tune_mode=$(printf '%s' "${TUNE:-}" | tr 'A-Z' 'a-z')

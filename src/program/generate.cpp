@@ -14084,7 +14084,11 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+#else
+        std::printf("READY %lld stop park\n", (long long) o.max_context);   // "stop": STOP; "park": PARK / UNPARK (cuda-checkpoint: NVIDIA only)
+#endif
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -14264,6 +14268,44 @@ int main(int argc, char** argv) {
                         (long long) xcache.slots(), (long long) xcache.full_slots(),
                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20),
                         (long long) (free_b >> 20), (long long) o.prefill_chunk);
+            return true;
+        };
+        // PARK / UNPARK (the server's "warm" mode), between requests.  Between the two the server suspends this process's GPU
+        // state with cuda-checkpoint (VRAM, context included, goes back; the host side - the arena, the pins - stays).  PARK
+        // quiesces whatever touches the card and gives the expert cache back first: its slots are refilled from the RAM arena
+        // on UNPARK, so they are not worth a copy into RAM.  Without --vram-elastic the whole VRAM image is the checkpoint's.
+        auto park_command = [&](bool park, std::string& e) -> bool {
+            const char* what = park ? "PARK: " : "UNPARK: ";
+            const bool elastic = xcache.segmented() && !src.complement_ready() && !peer.valid();
+            const auto t0 = Clock::now();
+            if (park) {
+                for (const PfPart& p : pf_parts)
+                    if (!p.lent.empty()) { e = "PARK: a prompt's loan is still out"; return false; }
+                if (!ver.wait_commit(e)) return false;
+                adapt_quiesce();
+                strata::core::conversation_checkpoint_join(nullptr);
+                strata::core::conversation_park_join();
+                if (elastic && !vram_command("VRAM 1000000000", e)) return false;   // every segment the floor allows
+            }
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                e = std::string(what) + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            for (const auto& stp : stages) {
+                const strata::core::OnDevice on(stp->dev);
+                if (cudaDeviceSynchronize() != cudaSuccess) {
+                    e = std::string(what) + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            if (!park && elastic && !vram_command("VRAM", e)) return false;     // the cache back, to the reserve the start had
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            std::fprintf(stderr, "strata serve: %s in %.0f ms, %lld MiB of VRAM free, expert cache %lld slots\n",
+                         park ? "parked" : "unparked", std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                         (long long) (free_b >> 20), (long long) xcache.slots());
+            std::printf("%s vram_free_mib=%lld vram_total_mib=%lld expert_slots=%lld\n", park ? "PARKED" : "UNPARKED",
+                        (long long) (free_b >> 20), (long long) (total_b >> 20), (long long) xcache.slots());
             return true;
         };
         // ---- --batch: the slots of the batch windows
@@ -15477,6 +15519,14 @@ int main(int argc, char** argv) {
                 if (batch_on()) verr = "VRAM: not while batch slots are decoding";
                 else vram_command(line, verr);
                 if (!verr.empty()) std::printf("ERR %s\n", verr.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "PARK" || line == "UNPARK") {   // the server's "warm" mode: see park_command
+                std::string perr;
+                if (line == "PARK" && batch_on()) perr = "PARK: not while batch slots are decoding";
+                else if (!park_command(line == "PARK", perr) && perr.empty()) perr = line + " failed";
+                if (!perr.empty()) std::printf("ERR %s\n", perr.c_str());
                 std::fflush(stdout);
                 continue;
             }

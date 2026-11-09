@@ -16,6 +16,9 @@
 #   --version V              label (default: read from CMakeLists.txt)
 #   --ctx DIR                keep the build context here (default: a temporary folder, removed after the build)
 #   --no-cache               docker build --no-cache
+#   --cuda-checkpoint-url URL --cuda-checkpoint-sha256 HEX
+#                            another copy of NVIDIA's cuda-checkpoint (WARM=1) than the pinned one the cuda flavor installs; the build
+#                            stops when the SHA-256 differs.  --no-cuda-checkpoint leaves it out
 #   --ctx-only               assemble the context and stop
 # Environment: STRATA_DOCKER_BUILD_OPTS adds options to `docker build` (for example --network host).
 # Nothing is pushed anywhere; the image stays in the local Docker.
@@ -23,7 +26,7 @@ set -eu
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
 repo=$(CDPATH= cd -- "$here/.." && pwd -P)
-flavor=""; tag=""; base=""; version=""; ctx=""; nocache=""; ctxonly=""
+flavor=""; tag=""; base=""; version=""; ctx=""; nocache=""; ctxonly=""; ck_url=""; ck_sha=""; ck_none=""
 engines=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,14 +39,18 @@ $2"; shift 2 ;;
     --version) version=$2; shift 2 ;;
     --ctx) ctx=$2; shift 2 ;;
     --no-cache) nocache=--no-cache; shift ;;
+    --cuda-checkpoint-url) ck_url=$2; shift 2 ;;
+    --cuda-checkpoint-sha256) ck_sha=$2; shift 2 ;;
+    --no-cuda-checkpoint) ck_none=1; shift ;;
     --ctx-only) ctxonly=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "build.sh: unknown option $1" >&2; exit 2 ;;
   esac
 done
 [ -n "$flavor" ] || { echo "build.sh: --flavor cuda|hip|sycl is required" >&2; exit 2; }
 case "$flavor" in cuda|hip|sycl) ;; *) echo "build.sh: --flavor must be cuda, hip or sycl" >&2; exit 2 ;; esac
 [ -n "$engines" ] || { echo "build.sh: --engine <package folder> is required" >&2; exit 2; }
+[ -z "$ck_url$ck_sha" ] || { [ -n "$ck_url" ] && [ -n "$ck_sha" ]; } || { echo "build.sh: --cuda-checkpoint-url and --cuda-checkpoint-sha256 go together" >&2; exit 2; }
 [ -n "$base" ] || { [ "$flavor" = sycl ] && base=ubuntu:26.04 || base=ubuntu:24.04; }
 if [ -z "$version" ]; then
   version=$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' "$repo/CMakeLists.txt" | head -1)
@@ -104,10 +111,15 @@ echo "context: $ctx"
 echo "flavor $flavor, base $base, engine(s): $engine_label, tag $tag"
 [ -n "$ctxonly" ] && { echo "context kept (--ctx-only)"; exit 0; }
 
+# without these the Dockerfile's own (pinned, hash-checked) cuda-checkpoint applies
+ck_args=""
+[ -z "$ck_none" ] || ck_args="--build-arg CUDA_CHECKPOINT_URL="
+[ -z "$ck_url" ] || ck_args="--build-arg CUDA_CHECKPOINT_URL=$ck_url --build-arg CUDA_CHECKPOINT_SHA256=$ck_sha"
+
 # shellcheck disable=SC2086
 docker build $nocache ${STRATA_DOCKER_BUILD_OPTS:-} \
   --build-arg "BASE_IMAGE=$base" --build-arg "FLAVOR=$flavor" \
-  --build-arg "STRATA_COMMIT=$commit" --build-arg "STRATA_VERSION=$version" --build-arg "ENGINE_LABEL=$engine_label" \
+  --build-arg "STRATA_COMMIT=$commit" --build-arg "STRATA_VERSION=$version" --build-arg "ENGINE_LABEL=$engine_label" $ck_args \
   -t "$tag" "$ctx"
 docker image inspect "$tag" --format 'built {{.RepoTags}} {{.Size}} bytes'
 echo "Not pushed anywhere. Size on disk: $(docker image inspect "$tag" --format '{{.Size}}') bytes."

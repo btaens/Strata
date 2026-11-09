@@ -100,6 +100,14 @@ COPY --from=engine-build /engine/ /opt/strata/components/engine/
 COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata
 RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
+# NVIDIA's cuda-checkpoint for WARM=1, pinned and hash-checked (see docker/Dockerfile); set CUDA_CHECKPOINT_URL to nothing to leave it out
+ARG CUDA_CHECKPOINT_URL=https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint
+ARG CUDA_CHECKPOINT_SHA256=707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db
+RUN if [ -n "$CUDA_CHECKPOINT_URL" ]; then \
+      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt /opt/strata/terminal/python/bin/python3 -c 'import hashlib, os, sys, urllib.request; url, want, out = sys.argv[1:4]; assert url.startswith("https://"), "https only"; data = urllib.request.urlopen(url, timeout=120).read(); got = hashlib.sha256(data).hexdigest(); assert got == want.lower(), "cuda-checkpoint: SHA-256 is " + got + ", not " + want; open(out, "wb").write(data); os.chmod(out, 0o755)' \
+        "$CUDA_CHECKPOINT_URL" "$CUDA_CHECKPOINT_SHA256" /usr/local/bin/cuda-checkpoint \
+      && echo "cuda-checkpoint installed (SHA-256 checked)"; \
+    fi
 ENV STRATA_COMPONENTS_DIR=/opt/strata/components STRATA_INSTALL_DIR=/data/install XDG_STATE_HOME=/data/state \
     XDG_CONFIG_HOME=/data/config HOME=/data/home PORT=8080 LANG=C.UTF-8 PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1 STRATA_IN_DOCKER=1 \
     NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility

@@ -35,6 +35,8 @@ EDITABLE = [
     ("mtp", "bool", "Draft layer (MTP): off starts the engine without it (about 1 GB less graphics memory, slower words per second); "
                     "empty or on: as installed"),
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
+    ("warm", "bool", "Unloading (idle unload, /unload) parks the model: its graphics memory goes back, its system memory "
+                     "stays, and the next request restores it fast (Linux, NVIDIA driver 570+, cuda-checkpoint)"),
     ("engine_silence_s", "num>=0", "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),

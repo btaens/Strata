@@ -21,6 +21,9 @@ services:
       VISION: ${VISION:-off}                 # on: the model reads pictures (about 0.9 GB more to download)
       TUNE: ${TUNE:-skip}                    # quick: up to about 20 minutes, once, then kept
       API_KEY: ${API_KEY:-}                  # empty: made on the first start; docker exec strata strata launch --show-key
+      WARM: ${WARM:-}                        # 1: unload parks the model in RAM (needs cuda-checkpoint in the image or at CUDA_CHECKPOINT)
+      IDLE_UNLOAD: ${IDLE_UNLOAD:-}          # seconds without requests before the model is unloaded (with WARM: parked); empty: never
+      LAZY_LOAD: ${LAZY_LOAD:-}              # 1: the first request loads the model
       # GPUS: "0,1"                          # several cards: which ones
     volumes:
       - strata-data:/data                    # the model, presets, tuning, the key. Survives updates of the image.

@@ -88,6 +88,19 @@ COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata
 RUN chmod 0755 /opt/strata/entrypoint.sh /opt/strata/healthcheck.sh /usr/local/bin/strata
 
+# Warm mode (WARM=1) needs NVIDIA's cuda-checkpoint: a 6 KB prebuilt program (NVIDIA publishes no releases; it is in the repo's bin/), linked
+# to the host driver's libcuda, which the NVIDIA Container Toolkit provides. The cuda flavor installs it, pinned to one commit of that repo and
+# checked against its SHA-256: the build stops when the file differs. Other flavors skip it. To use another copy, give the two build arguments
+# (docker/build.sh --cuda-checkpoint-url / --cuda-checkpoint-sha256); to leave it out, set CUDA_CHECKPOINT_URL to nothing (--no-cuda-checkpoint).
+ARG CUDA_CHECKPOINT_URL=https://raw.githubusercontent.com/NVIDIA/cuda-checkpoint/00d5cce84c628088d6caa203fc4af40c1538b6f7/bin/x86_64_Linux/cuda-checkpoint
+ARG CUDA_CHECKPOINT_SHA256=707fa7f54136824d6c1d6dd724b9b1717610f831033c00d06da474de363a06db
+RUN if [ -n "$CUDA_CHECKPOINT_URL" ] && [ "$FLAVOR" = cuda ]; then \
+      [ -n "$CUDA_CHECKPOINT_SHA256" ] || { echo "CUDA_CHECKPOINT_URL needs CUDA_CHECKPOINT_SHA256 (the SHA-256 of the file)"; exit 1; }; \
+      SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt /opt/strata/terminal/python/bin/python3 -c 'import hashlib, os, sys, urllib.request; url, want, out = sys.argv[1:4]; assert url.startswith("https://"), "https only"; data = urllib.request.urlopen(url, timeout=120).read(); got = hashlib.sha256(data).hexdigest(); assert got == want.lower(), "cuda-checkpoint: SHA-256 is " + got + ", not " + want; open(out, "wb").write(data); os.chmod(out, 0o755)' \
+        "$CUDA_CHECKPOINT_URL" "$CUDA_CHECKPOINT_SHA256" /usr/local/bin/cuda-checkpoint \
+      && echo "cuda-checkpoint installed (SHA-256 checked)"; \
+    fi
+
 # Does the dynamic linker find every library of the package inside this image? (the GPU driver's libcuda / libnvidia-* come from the host)
 RUN set -e; \
     for d in /opt/strata/components/engine/*/; do \

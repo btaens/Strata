@@ -359,6 +359,7 @@ By default the model stays loaded until you close Strata. Three server options, 
 | Option | Config key | What it does |
 | --- | --- | --- |
 | `--idle-unload 600` | `"idle_unload_s": 600` | Unload the model after 600 s without requests. The next request loads it again. |
+| `--warm` | `"warm": true` | Unloading (idle unload, `POST /unload`) parks the model instead of ending it, see below. |
 | `--min-free-vram-mib 11000` | `"min_free_vram_mib": 11000` | Load an unloaded model only when that much VRAM is free (it waits up to 15 s for memory being given back). Otherwise answer **503** "the GPU is in use by another program". With several GPUs it checks the first one. |
 | `--before-load "cmd"` | `"before_load": "cmd"` or `["cmd", "arg"]` | A command run before the model is loaded again, for example one that unloads another server's model. |
 | | `"before_load_timeout_s": 120` | How long that command may run. When it fails or times out, the free VRAM decides: with `min_free_vram_mib` set and not enough free, the request gets **503** with `Retry-After`; otherwise the model loads with a warning. `"before_load_strict": true` always refuses on a failure; `"before_load_ignore_failure": true` always loads. |
@@ -379,6 +380,22 @@ API without the engine or the vision encoder. The first generation request or `P
 `before_load` and `min_free_vram_mib`. `POST /v1/load` and `/v1/unload` are JSON control aliases (they need the API key,
 `application/json` and no foreign browser Origin, and return **409** while a request is active or queued). `/api/health`
 aliases `/health`, and `/v1/status` exposes `loaded` and `auto_load`.
+
+**Warm mode: park instead of unload** (opt-in, `--warm` or `"warm": true`; Linux, NVIDIA driver 570 or newer, NVIDIA's
+`cuda-checkpoint` on the PATH or named in `"cuda_checkpoint"`). The engine process stays. Idle unload and `POST /unload` ask it to
+quiesce (`PARK`: the adaptive tier lands, the expert cache gives its segments back when `--vram-elastic` is on) and then suspend its
+GPU state with `cuda-checkpoint`: the VRAM, the CUDA context included, goes back to the system, while the process, its expert arena,
+its pinned pages, its CUDA graphs and its conversation stay. The next request restores it at the same addresses and `UNPARK` refills
+the expert cache from the RAM arena, so there is no file read, no re-pinning and no graph capture. The answers keep the status
+`"unloaded"`; `GET /v1/status` has `"parked": true`. `POST /unload?full=1` (or `{"full": true}` on `/v1/unload`) ends the process
+for real, which is the only way to give the RAM back. The suspended VRAM image is copied into RAM: without `--vram-elastic` that is
+everything on the card, and a park that would not fit in the RAM available (2 GiB kept free) unloads instead. Whatever fails - no
+`cuda-checkpoint`, an engine that cannot park, a refused lock, a failed restore - falls back to the plain unload or start, said in the
+log. With `--lazy` the engine starts, then parks (it needs the VRAM once, at the start). `STRATA_WARM`, `STRATA_LAZY_LOAD`,
+`STRATA_IDLE_UNLOAD_S` and `STRATA_CUDA_CHECKPOINT` in the server's environment do what the flags and keys do (the flag wins, then the
+variable, then the config; this is how the [Docker image](DOCKER.md#warm-mode) sets them). Image jobs with the `unload` policy park the
+model too and keep its conversation. Not measured yet: how long a restore takes, and whether `cuda-checkpoint` accepts every engine
+configuration (the registered expert arena, `--batch`, DFlash2).
 
 **Giving part of the VRAM back while it keeps serving** (opt-in, one NVIDIA GPU, [VRAM_ELASTIC.md](VRAM_ELASTIC.md)). With
 `"vram_elastic": true` (engine flag `--vram-elastic`) the expert cache is allocated in 512 MiB segments
@@ -477,7 +494,7 @@ trained with, not a hard token limit.
 
 All are optional. Setup rewrites the config when run again and keeps keys it does not manage. The About tab's Model settings
 card edits some of them (the sampling defaults, `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`,
-`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and
+`effort_position`, `aliases`, `idle_unload_s`, `lazy_load`, `warm`, `engine_silence_s`, `api_monitor`, `open_browser` and
 `--vram-reserve-mib`). An empty field removes the key, the earlier file is kept as `strata-<model>.json.bak`, and the change
 applies at the next start. Network, key, MCP and program keys are not editable there.
 
@@ -503,6 +520,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `parallel` | `1` | Up to N requests decoded together in batch slots ([BATCHING.md](BATCHING.md)). |
 | `api_monitor` | off | Records requests for `/api-monitor`. |
 | `lazy_load` | off | Start without loading the model. |
+| `warm` | off | Unloading parks the model in RAM instead of ending the engine (Linux, NVIDIA 570+, `cuda-checkpoint`). |
 | `slot_save_path` | none | Enables session files. |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |

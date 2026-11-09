@@ -26,6 +26,13 @@ def sh_path(p) -> str:
 
 
 class Scripts(unittest.TestCase):
+    def test_dockerfile_pins_the_cuda_checkpoint_program_by_commit_and_hash(self):
+        text = (DOCKER / "Dockerfile").read_text(encoding="utf-8")
+        url = re.search(r"^ARG CUDA_CHECKPOINT_URL=(\S+)$", text, re.M).group(1)
+        sha = re.search(r"^ARG CUDA_CHECKPOINT_SHA256=(\S+)$", text, re.M).group(1)
+        self.assertRegex(url, r"^https://raw\.githubusercontent\.com/NVIDIA/cuda-checkpoint/[0-9a-f]{40}/bin/x86_64_Linux/cuda-checkpoint$")
+        self.assertRegex(sha, r"^[0-9a-f]{64}$")
+
     @unittest.skipIf(SH is None, "needs sh")
     def test_shell_scripts_parse(self):
         for name in ("entrypoint.sh", "strata-wrapper.sh", "healthcheck.sh", "build.sh", "publish.sh"):

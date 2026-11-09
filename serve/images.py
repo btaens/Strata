@@ -435,6 +435,18 @@ def _make_room(svc, gen: ImageGen, policy: str, need: int):
             gen._say(f"image job: the engine could not give VRAM back ({e}); the job runs with what is free")
             return None
     if policy == "unload":
+        if svc.can_park():                           # "warm": the model waits in system memory with its conversation
+            try:
+                eng.park()
+                gen._say("image job: the model is parked in system memory (its conversation stays in it)")
+                if svc.vision is not None and hasattr(svc.vision, "unload"):
+                    svc.vision.unload()
+                return "unloaded"
+            except Exception as e:                   # noqa: BLE001 - park() ended the engine: the plain unload's result
+                gen._say(f"image job: the model could not be parked ({e}); it was unloaded")
+                if svc.vision is not None and hasattr(svc.vision, "unload"):
+                    svc.vision.unload()
+                return "unloaded"
         saved = None
         if hasattr(eng, "session_file") and not getattr(eng, "batch", 0):
             path = str(gen.dir / f"llm-session-{secrets.token_hex(6)}.bin")

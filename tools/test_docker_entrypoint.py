@@ -31,7 +31,7 @@ case "$*" in
   *"launch --status"*) echo '{"running": [{"name": "docker", "state": "ready"}]}'; exit 0 ;;
   *"--show-key"*) echo "KEY-FROM-PRESET-0123456789"; exit 0 ;;
   *"launch --stop"*) echo "stopped" >> "$STUB_LOG"; exit 0 ;;
-  *"launch --no-tui"*) echo "key-env=${STRATA_LAUNCH_KEY:-}" >> "$STUB_LOG"; [ -n "${STUB_FAIL:-}" ] && exit 6; exit 0 ;;
+  *"launch --no-tui"*) echo "key-env=${STRATA_LAUNCH_KEY:-}" >> "$STUB_LOG"; echo "server-env=${STRATA_WARM:-}|${STRATA_IDLE_UNLOAD_S:-}|${STRATA_LAZY_LOAD:-}|${STRATA_CUDA_CHECKPOINT:-}" >> "$STUB_LOG"; [ -n "${STUB_FAIL:-}" ] && exit 6; exit 0 ;;
 esac
 exit 0
 """
@@ -54,7 +54,8 @@ class Entrypoint(unittest.TestCase):
         self.script.write_text(text, encoding="utf-8")
 
     def env(self, **extra):
-        env = {k: v for k, v in os.environ.items() if k not in ("MODEL", "API_KEY", "CONTEXT", "VISION", "TUNE", "PORT", "GPU", "GPUS")}
+        env = {k: v for k, v in os.environ.items() if k not in ("MODEL", "API_KEY", "CONTEXT", "VISION", "TUNE", "PORT", "GPU", "GPUS",
+                                                                "WARM", "IDLE_UNLOAD", "LAZY_LOAD", "CUDA_CHECKPOINT", "STRATA_WARM")}
         env.update(STUB_LOG=str(self.log), STRATA_CPUINFO=str(self.tmp / "cpuinfo"), **extra)
         (self.tmp / "cpuinfo").write_text("flags : fpu avx2 sse4_2\n")
         return env
@@ -134,6 +135,56 @@ class Entrypoint(unittest.TestCase):
         r = subprocess.run([SH, str(self.script)], env=self.env(STUB_FAIL="1", MODEL="Q2_0"), capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 6)
         self.assertIn("stopped with code 6", r.stderr)
+
+    def devices(self, name: str) -> str:
+        (self.tmp / "dev").mkdir(exist_ok=True)
+        (self.tmp / "dev" / name).write_text("")
+        return str(self.tmp / "dev")
+
+    def test_warm_idle_and_lazy_reach_the_server_as_environment_not_as_flags(self):
+        tool = self.tmp / "cuda-checkpoint"
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
+        p = self.start(WARM="Yes", IDLE_UNLOAD="600", LAZY_LOAD="1", CUDA_CHECKPOINT=str(tool), STUB_BACKEND="cuda",
+                       STRATA_DEV_DIR=self.devices("nvidia0"), MODEL="Q2_0")
+        log = self.wait_for("--show-key")
+        self.assertIn(f"server-env=1|600|1|{tool}", log)
+        for word in ("warm", "idle", "lazy"):
+            self.assertNotIn(word, self.launch_line(log).lower())
+        code, out, err = self.stop(p)
+        self.assertNotIn("cuda-checkpoint", err)                         # found: nothing to warn about
+        link = self.tmp / "dev" / "char" / "195:0"                       # what cuda-checkpoint looks for (NVIDIA/cuda-checkpoint#58)
+        self.assertTrue(link.is_symlink() and link.exists())
+        self.assertEqual(os.readlink(link), "../nvidia0")
+
+    def test_zero_turns_a_setting_off_for_the_server(self):
+        p = self.start(WARM="0", LAZY_LOAD="off")
+        self.assertIn("server-env=0||0|", self.wait_for("--show-key"))
+        self.stop(p)
+
+    def test_unset_settings_are_not_exported(self):
+        p = self.start()
+        self.assertIn("server-env=|||", self.wait_for("--show-key"))
+        self.stop(p)
+
+    def test_warm_without_cuda_checkpoint_or_without_an_nvidia_card_warns_and_goes_on(self):
+        p = self.start(WARM="1", STUB_BACKEND="cuda", STRATA_DEV_DIR=self.devices("nvidia0"), CUDA_CHECKPOINT=str(self.tmp / "missing"))
+        self.wait_for("--show-key")
+        code, out, err = self.stop(p)
+        self.assertIn("cuda-checkpoint", err)
+        self.assertIn("unloaded as usual", err)
+        self.log.unlink()
+        p = self.start(WARM="1", STUB_BACKEND="hip", STRATA_DEV_DIR=self.devices("kfd"))
+        self.wait_for("--show-key")
+        code, out, err = self.stop(p)
+        self.assertIn("WARM=1 needs an NVIDIA card", err)
+
+    def test_bad_warm_or_idle_values_are_plain_errors(self):
+        for name, value in (("WARM", "maybe"), ("LAZY_LOAD", "2"), ("IDLE_UNLOAD", "ten")):
+            with self.subTest(name=name):
+                r = subprocess.run([SH, str(self.script)], env=self.env(**{name: value}), capture_output=True, text=True, timeout=30)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn(name, r.stderr)
 
     def test_bad_vision_value_is_a_plain_error(self):
         r = subprocess.run([SH, str(self.script)], env=self.env(VISION="maybe"), capture_output=True, text=True, timeout=30)

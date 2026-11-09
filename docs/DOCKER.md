@@ -128,6 +128,10 @@ screens; leave out what you do not care about.
 | `PORT` | the port inside the container | `8080` |
 | `PRESET` | the preset name in `/data` | `docker` |
 | `STRATA_SET` | advanced engine settings, space separated, like `strata launch --set` (`"prefill=65536 STRATA_PIN_BY_NEED=1"`) | none |
+| `WARM` | `1`: unloading parks the model in RAM instead of ending the engine ([Warm mode](#warm-mode)); NVIDIA only | off |
+| `IDLE_UNLOAD` | seconds without requests before the model is unloaded (with `WARM=1`: parked) | never |
+| `LAZY_LOAD` | `1`: the server starts without the model and the first request loads it (with `WARM=1`: it loads, then parks) | off |
+| `CUDA_CHECKPOINT` | path of NVIDIA's `cuda-checkpoint` inside the container | the one on the `PATH` |
 
 Your choices are saved as a preset in the volume. Start again with no settings and the saved preset is used; start with
 settings and they replace the saved ones (tuning results are kept). To change one thing, recreate the container with the new
@@ -155,6 +159,32 @@ Mount the folder with the model's GGUF files read-only and name it: `-v /srv/ggu
   and does not follow links).
 - Without `MODEL_PATH`, files you put into the volume by hand (`/data/Strata-data/models/<model folder>/`) are found as well, if they have the
   published names.
+
+### Warm mode
+
+`WARM=1`, `IDLE_UNLOAD` and `LAZY_LOAD` are not `strata launch` flags. The entrypoint hands them to the server as environment
+variables (`STRATA_WARM`, `STRATA_IDLE_UNLOAD_S`, `STRATA_LAZY_LOAD`, `STRATA_CUDA_CHECKPOINT`); the server reads them when it
+starts. A command-line flag wins over them, and they win over the run config's `warm`, `idle_unload_s` and `lazy_load`. `0` turns one
+off. Anything that is not `1`/`0` (or, for `IDLE_UNLOAD`, a number of seconds) stops the start with a message.
+
+With `WARM=1` the idle unload and `POST /unload` park the model instead of ending it: the graphics memory goes back to the system, the
+RAM stays, and the next request restores it ([DETAILS.md](DETAILS.md#sharing-the-gpu-with-other-programs-optional)). It needs an
+NVIDIA card, a host driver of 570 or newer, and NVIDIA's `cuda-checkpoint` program. The cuda image has it: a 6 KB prebuilt program that
+the build downloads from NVIDIA's repository at one pinned commit and checks against its SHA-256 (the build stops when the file differs). It
+uses the host driver's `libcuda`, which the NVIDIA Container Toolkit provides. The other images do not have it. To use another copy, or to
+leave it out:
+
+```sh
+docker/build.sh --flavor cuda --engine <package folder> --cuda-checkpoint-url <https URL of the program> --cuda-checkpoint-sha256 <its SHA-256>
+docker/build.sh --flavor cuda --engine <package folder> --no-cuda-checkpoint
+docker run ... -v /opt/tools/cuda-checkpoint:/usr/local/bin/cuda-checkpoint:ro -e WARM=1 -e IDLE_UNLOAD=600 ...
+```
+
+With `WARM=1` the entry point makes the `/dev/char/195:N` links the program looks for (some containers have `/dev/nvidiaN` without
+them). The container logs a warning at the start when `WARM=1` finds no program or no NVIDIA engine, and the model is then unloaded as
+usual. Passing only some of the host's cards into the container needs a host driver of 580 or newer (NVIDIA lists it as "container partial
+passthrough"). Not tested inside a container yet: if `cuda-checkpoint` is refused there, the server log says why on the first unload and the
+model is unloaded as usual.
 
 ## The API key
 

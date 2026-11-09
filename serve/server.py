@@ -86,6 +86,8 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import park as park_mod  # noqa: E402
+from serve.park import ParkFailed  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -341,6 +343,33 @@ def _timeout_env(name: str, default: float) -> float | None:
     except ValueError:
         v = default
     return None if v <= 0 else v
+
+
+def env_bool(name: str, default: bool) -> bool:
+    """A yes/no setting from the environment (1/true/on/yes, 0/false/off/no); `default` when it is unset or says neither.  The
+    container's way to set what the command line and the run config set (docker/entrypoint.sh)."""
+    v = os.environ.get(name, "").strip().lower()
+    if v in ("1", "true", "on", "yes"):
+        return True
+    if v in ("0", "false", "off", "no"):
+        return False
+    if v:
+        print(f"[strata] {name}={v!r} is not 1 or 0; ignored", flush=True)
+    return default
+
+
+def env_seconds(name: str, default: float) -> float:
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return default
+    try:
+        s = float(v)
+        if s >= 0:
+            return s
+    except ValueError:
+        pass
+    print(f"[strata] {name}={v!r} is not a number of seconds (0 or more); ignored", flush=True)
+    return default
 
 
 # #1317 part 2: the quick watchdog for a FROZEN engine.  engine_silence_s (above) is generous on purpose: a slow PC reads a
@@ -1121,6 +1150,12 @@ class StrataEngine:
     DRAIN_TIMEOUT_S = 300.0              # how long an interrupted request waits, with no line from its engine, for DONE / BADM
     QUARANTINE_S = 600.0                 # ... and how long a slot or the control lines stay held after that with no line
     multi = 0                            # DeepSeek --parallel (READY ... multi=N): conversations the engine holds at once (batch = N too)
+    can_park = False                     # READY <ctx> stop park: the engine answers PARK / UNPARK (see park())
+    parked = False                       # alive, its GPU state suspended by cuda-checkpoint: alive() is False meanwhile
+    checkpoint_bin = None                # cuda-checkpoint; main() sets it when "warm" is on (None: no parking)
+    PARK_TIMEOUT_S = 120.0               # how long PARK / UNPARK may take to answer
+    CHECKPOINT_TIMEOUT_S = 300.0         # ... and each cuda-checkpoint step
+    CHECKPOINT_LOCK_MS = 30000           # cuda-checkpoint's own wait for in-flight CUDA calls
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -1155,6 +1190,7 @@ class StrataEngine:
         self.log_path = log
         self.proc, self.pump, self.log = None, None, None
         self.ended, self.unloaded = True, True
+        self.parked = False
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.last = {}
@@ -1240,6 +1276,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_park = "park" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1494,7 +1531,7 @@ class StrataEngine:
 
     def alive(self) -> bool:
         proc = self.proc                                 # read once: restart() / close() may set it to None meanwhile
-        return proc is not None and not getattr(self, "ended", False) and proc.poll() is None
+        return proc is not None and not getattr(self, "ended", False) and proc.poll() is None and not self.parked
 
     def exit_code(self):
         if self.proc is None:
@@ -1508,6 +1545,91 @@ class StrataEngine:
         """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
         self.close()
         self.unloaded = True
+
+    def _command(self, cmd: str, expect: str) -> dict:
+        """One control line (PARK / UNPARK) and its answer line `expect k=v ...` -> {k: v}; the VRAM line the engine
+        prints on the way is kept as out["vram"].  ValueError with the engine's reason on ERR, EngineDied when it ended."""
+        if self.proc is None or self.proc.poll() is not None:
+            raise EngineDied("the engine is not running")
+        self.proc.stdin.write(cmd + "\n")
+        self.proc.stdin.flush()
+        deadline = time.time() + self.PARK_TIMEOUT_S
+        out: dict = {}
+
+        def fields(line):
+            kv = {}
+            for item in line.split()[1:]:
+                k, _, v = item.partition("=")
+                kv[k] = int(v) if v.lstrip("-").isdigit() else v
+            return kv
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied(f"the engine did not answer {cmd}") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or f"the engine refused {cmd}")
+            if line.startswith("VRAM "):
+                out["vram"] = fields(line)
+            elif line == expect or line.startswith(expect + " "):
+                return {**out, **fields(line)}
+            if time.time() > deadline:
+                raise EngineDied(f"the engine did not answer {cmd}")
+
+    def park(self) -> dict:
+        """Between requests (the caller holds the service's FIFO): PARK, then cuda-checkpoint's lock and checkpoint.  The
+        engine process stays, its VRAM - context included - is released and its image waits in RAM; unpark() brings it
+        back at the same addresses.  Raises ParkFailed when it cannot: the engine is ended then (unloaded), except when
+        parking was never possible (no READY `park`, no cuda-checkpoint), which leaves it untouched."""
+        if not self.can_park or not self.checkpoint_bin:
+            raise ParkFailed("the engine does not offer PARK" if not self.can_park else "cuda-checkpoint was not found")
+        if not self.alive():
+            raise ParkFailed("the engine is not running")
+        t0 = time.monotonic()
+        locked = False
+        try:
+            with self._exclusive_control():
+                info = self._command("PARK", "PARKED")
+                park_mod.check_room(park_mod.process_vram_mib(self.proc.pid), info.get("vram_free_mib"),
+                                    info.get("vram_total_mib"))
+                park_mod.run_checkpoint(self.checkpoint_bin, "lock", self.proc.pid, self.CHECKPOINT_TIMEOUT_S,
+                                        self.CHECKPOINT_LOCK_MS)
+                locked = True
+                park_mod.run_checkpoint(self.checkpoint_bin, "checkpoint", self.proc.pid, self.CHECKPOINT_TIMEOUT_S)
+        except (EngineDied, ValueError, ParkFailed) as e:
+            self.parked = locked                          # a process that was locked cannot end itself: close() kills it
+            self.unload()
+            if isinstance(e, ParkFailed):
+                raise
+            raise ParkFailed(str(e)) from e
+        self.parked, self.unloaded = True, True
+        info["ms"] = round((time.monotonic() - t0) * 1000)
+        return info
+
+    def unpark(self) -> dict:
+        """cuda-checkpoint's restore and unlock, then UNPARK (the engine puts its expert cache back).  ParkFailed when it
+        cannot - the engine is ended then and the caller starts it again."""
+        if not self.parked or self.proc is None or self.proc.poll() is not None:
+            self.unload()
+            raise ParkFailed("the parked engine is gone")
+        t0 = time.monotonic()
+        try:
+            park_mod.run_checkpoint(self.checkpoint_bin, "restore", self.proc.pid, self.CHECKPOINT_TIMEOUT_S)
+            park_mod.run_checkpoint(self.checkpoint_bin, "unlock", self.proc.pid, self.CHECKPOINT_TIMEOUT_S)
+            self.parked = False
+            with self._exclusive_control():
+                info = self._command("UNPARK", "UNPARKED")
+        except (EngineDied, ValueError, ParkFailed) as e:
+            self.unload()
+            if isinstance(e, ParkFailed):
+                raise
+            raise ParkFailed(str(e)) from e
+        self.unloaded = False
+        info["ms"] = round((time.monotonic() - t0) * 1000)
+        return info
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -3098,7 +3220,14 @@ class StrataEngine:
         a while; ENGINE_QUIT_WAIT_S), then terminate (ENGINE_TERM_WAIT_S), then kill (ENGINE_KILL_WAIT_S).  Raises
         EngineStuck when it still runs after all three."""
         if self.proc is None:
+            self.parked = False
             return
+        if self.parked and self.proc.poll() is None:    # its GPU state is suspended: it cannot run its own shutdown
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         try:
             if self.proc.poll() is None:
                 try:
@@ -3132,6 +3261,7 @@ class StrataEngine:
                     self.log.close()
                 self.proc = None
                 self.ended = True
+                self.parked = False
                 self.progress, self.last = None, {}
                 self.progress_ms, self.reused = 0, 0
 
@@ -4826,6 +4956,8 @@ class Service:
         self.tool_call_recovery = True                    # default on (0.2.8): tool calls in forms next to the template's; config "tool_call_recovery": false turns it off
         self.images = None                                # serve/images.py's ImageGen when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
+        self.warm = False                                 # "warm": true: unload parks the engine (VRAM back, RAM kept) - serve/park.py
+        self.warm_said = False
         self.stop_ids = end_token_ids(tokenizer)
         self.family = None                              # the model family ("deepseek41"): set_family() below
         self.parser_cls = parser_for_template(getattr(template, "source", None))   # reads the model's output (reasoning, content, tool calls): by the template's tool-call form
@@ -5306,6 +5438,10 @@ class Service:
             vision_started = True
         if self.loaded():
             return
+        if getattr(self.engine, "parked", False):
+            if self._unpark():
+                self._after_load()
+                return
         if getattr(self.engine, "unloaded", False):
             print("[strata] loading the model again (it was unloaded) ...", flush=True)
         else:
@@ -5324,6 +5460,20 @@ class Service:
                 raise EngineDied(f"the engine could not be started: {e}") from e
             raise
         print("[strata] the engine is running again", flush=True)
+        self._after_load()
+
+    def _unpark(self) -> bool:
+        """Bring a parked engine's VRAM back; False (the engine ended) when that failed - the caller starts it again."""
+        print("[strata] bringing the model back from system memory ...", flush=True)
+        try:
+            info = self.engine.unpark()
+        except ParkFailed as e:
+            print(f"[strata] the parked model could not be restored ({e}); starting the engine again", flush=True)
+            return False
+        print(f"[strata] the model is back in VRAM ({info.get('ms', 0) / 1000:.1f} s)", flush=True)
+        return True
+
+    def _after_load(self) -> None:
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
@@ -5428,24 +5578,34 @@ class Service:
         finally:
             self.fifo.release()
 
-    def unload_waiting(self, wait_s: float) -> str:
+    def unload_waiting(self, wait_s: float, full: bool = False) -> str:
         """#1997: unload(), but a running or queued request is waited for (up to wait_s) instead of answering "busy":
         a peer server that needs this GPU can then free the card on the server's terms.  "busy" after wait_s."""
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
-            r = self.unload()
+            r = self.unload(full=full)
             if r != "busy" or time.monotonic() >= deadline:
                 return r
             time.sleep(0.25)
 
-    def unload(self, idle_for: float | None = None) -> str:
+    def can_park(self) -> bool:
+        """"warm" is on and this engine can keep its RAM and give its VRAM back (READY park, cuda-checkpoint found)."""
+        return bool(self.warm and getattr(self.engine, "can_park", False) and getattr(self.engine, "checkpoint_bin", None)
+                    and hasattr(self.engine, "park"))
+
+    def unload(self, idle_for: float | None = None, full: bool = False) -> str:
         """Stop the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, or
-        with idle_for: one ran more recently than that) or "unsupported"."""
+        with idle_for: one ran more recently than that) or "unsupported".  With "warm" on the engine is parked instead -
+        its VRAM goes back, its RAM stays - unless `full` asks for the plain unload (which also ends a parked engine)."""
         if not hasattr(self.engine, "unload"):
             return "unsupported"
         if not self.fifo.acquire(blocking=False):
             return "busy"
         try:
+            if full and getattr(self.engine, "parked", False):
+                self.engine.unload()
+                print("[strata] the parked model was unloaded; the next request loads it again", flush=True)
+                return "unloaded"
             if not self.engine.alive():
                 self._release_orphan_encoder()                  # POST /unload gives the card back even when the engine already died (#4352)
                 return "not loaded"
@@ -5454,12 +5614,28 @@ class Service:
                     return "busy"
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
-            self.engine.unload()
+            parked = None
+            if self.warm and not full:
+                if self.can_park():
+                    try:
+                        parked = self.engine.park()
+                    except ParkFailed as e:
+                        print(f"[strata] the model could not be parked ({e}); unloading it instead", flush=True)
+                elif not self.warm_said:
+                    self.warm_said = True
+                    print("[strata] warm: this engine cannot be parked (it needs the Qwen engine with PARK, cuda-checkpoint "
+                          "on Linux and an NVIDIA driver of 570 or newer); unloading it as usual", flush=True)
+            if parked is None:
+                self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
-                  "the next request loads it again", flush=True)
+            after = f" after {idle_for:.0f} s idle" if idle_for else ""
+            if parked is not None:
+                print(f"[strata] model parked in system memory{after} ({parked.get('ms', 0) / 1000:.1f} s); the next "
+                      "request brings it back", flush=True)
+            else:
+                print(f"[strata] model unloaded{after}; the next request loads it again", flush=True)
             return "unloaded"
         finally:
             self.fifo.release()
@@ -5716,6 +5892,7 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            "warm": self.warm, "parked": bool(getattr(self.engine, "parked", False)),
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -8160,7 +8337,8 @@ def make_handler(svc: Service):
                 try:
                     wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                          svc.UNLOAD_WAIT_S)
-                    r = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                    full = parse_qs(urlsplit(self.path).query).get("full", [""])[0].lower() in ("1", "true")
+                    r = svc.unload_waiting(wait_s, full) if wait_s else svc.unload(full=full)
                 except EngineStuck as e:
                     self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -8209,7 +8387,8 @@ def make_handler(svc: Service):
                     if path == "/v1/unload":
                         wait_s = unload_wait(parse_qs(urlsplit(self.path).query).get("wait", [None])[0],
                                              svc.UNLOAD_WAIT_S)
-                        result = svc.unload_waiting(wait_s) if wait_s else svc.unload()
+                        full = req.get("full") is True
+                        result = svc.unload_waiting(wait_s, full) if wait_s else svc.unload(full=full)
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
                     else:
@@ -9913,6 +10092,10 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                                          "{...}}); the web app's chat can use their tools (also \"mcp_servers\" in "
                                          "the config)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
+    ap.add_argument("--warm", action="store_true",
+                    help="unloading (--idle-unload, POST /unload) parks the engine instead of ending it: its VRAM goes back to "
+                         "the system, its RAM and process stay, and the next request restores it in seconds. Linux, NVIDIA driver "
+                         "570+, cuda-checkpoint (also \"warm\": true in the config). With --lazy the engine starts, then parks")
     ap.add_argument("--api-monitor", action="store_true",
                     help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
                          "memory (also \"api_monitor\": true in the config; off by default)")
@@ -10079,6 +10262,7 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    warm = False
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -10092,7 +10276,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
-        lazy = a.lazy or cfg.get("lazy_load") is True
+        lazy = a.lazy or env_bool("STRATA_LAZY_LOAD", cfg.get("lazy_load") is True)
+        warm = a.warm or env_bool("STRATA_WARM", cfg.get("warm") is True)
         for line in card_roles_lines(cfg):             # the card roles: said first; every card Off stops here, before anything touches a card
             print(line, flush=True)
         if cfg.get("vision"):
@@ -10114,7 +10299,8 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
                       "encoder's GPU, or the first picture may not get it", flush=True)
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                             env=vision_env(cfg, env), lazy=lazy)
-        print("model unloaded; the first request loads it ..." if lazy else
+        print("model unloaded; the first request loads it ..." if lazy and not warm else
+              "loading the model, then parking it in system memory until the first request ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg, announce=False) if "args" in cfg else [])      # #1080
         note = card_note(cfg, env)
@@ -10167,8 +10353,15 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         elif split:
             engine = start_split(cfg, split, exe, effort_end or [], lazy, offline=a.offline)
         else:
-            engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
+            engine = start_engine_or_fallback(cfg, exe, effort_end, env, lazy and not warm, tok, offline=a.offline, batch_telemetry=a.batch_telemetry)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
+        if warm and hasattr(engine, "park"):
+            engine.checkpoint_bin = park_mod.find_checkpoint(cfg.get("cuda_checkpoint"))
+            if engine.checkpoint_bin is None:
+                print("[strata] warm: cuda-checkpoint was not found (Linux, NVIDIA driver 570+; \"cuda_checkpoint\" in the "
+                      "config names it): the model will be unloaded as usual", flush=True)
+            elif engine.alive() and not engine.can_park:
+                print("[strata] warm: this engine does not offer PARK; the model will be unloaded as usual", flush=True)
         warn_tight_ram(engine.info.get("arena_mib"))
         note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
                                  linux_desktop()) if not groups and not split else None
@@ -10284,7 +10477,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
-    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
+    svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else \
+        env_seconds("STRATA_IDLE_UNLOAD_S", float(cfg.get("idle_unload_s") or 0))
+    svc.warm = warm
+    if warm and lazy:                                   # started above, parked now (or unloaded, when it cannot be parked)
+        svc.unload()
     svc.min_free_vram_mib = a.min_free_vram_mib if a.min_free_vram_mib is not None else \
         int(cfg.get("min_free_vram_mib") or 0)
     svc.before_load = a.before_load or cfg.get("before_load") or None
